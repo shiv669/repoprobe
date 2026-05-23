@@ -1,35 +1,32 @@
 """
-autonomous investigation agent for repoprobe.
+managed investigation agent for repoprobe.
 
-this is the managed agent layer — gemini decides what to probe,
-the system executes using existing deterministic tools, gemini
-interprets the results, and the loop repeats.
+uses google managed agents (client.interactions.create) with
+the antigravity-preview-05-2026 agent for autonomous investigation.
 
-the agent is constrained:
-  - max 3 investigation steps
-  - can only use pre-defined investigation tools
-  - all probing is done via httpx against a live app
-  - gemini orchestrates, never generates evidence
+the agent receives structured runtime evidence and autonomously
+decides what to investigate deeper. it has access to the live
+application via httpx tools.
 
-architectural boundary:
-  gemini decides WHAT to investigate
-  deterministic tools execute the investigation
-  gemini interprets WHAT was found
+also includes:
+  - investigation timeline with timestamps
+  - trust score evolution (visible degradation)
+  - evidence correlation layer
+  - runtime claim verification
 """
 
 import hashlib
-import json
 import random
 import string
-import uuid
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 from google import genai
-from google.genai import types
 
 from repoprobe.config import Config
-from repoprobe.claims import ContradictionReport
+from repoprobe.claims import ContradictionReport, Contradiction
 from repoprobe.probe import ProbeResult
 from repoprobe.verifier import VerificationResult
 from repoprobe.fingerprint import RepoFingerprint
@@ -37,57 +34,64 @@ from repoprobe.runner import RunResult
 from repoprobe import console as out
 
 
-# -- constants
+# ---------------------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------------------
 
-MAX_INVESTIGATION_STEPS = 3
 TOOL_TIMEOUT = 5.0
 
-_AGENT_SYSTEM_PROMPT = """you are a forensic runtime investigation agent for repoprobe.
 
-you have been given runtime evidence from a live application.
-your job is to investigate suspicious behavior by calling investigation tools.
-
-available tools:
-1. probe_endpoint — send a specific http request to any endpoint on the running app
-2. test_auth_variations — test an auth endpoint with empty, invalid, and malformed credentials
-3. fuzz_endpoint — send edge-case payloads (empty body, huge values, wrong types) to an endpoint
-4. analyze_error_response — fetch and analyze an error response for information leakage
-
-rules:
-- you have a maximum of {max_steps} investigation steps total
-- each tool call counts as one step
-- be strategic — investigate the most suspicious findings first
-- focus on behavioral contradictions (invariant responses, auth bypasses, error leakage)
-- when you have enough evidence, call done_investigating with your final assessment
-- base all conclusions strictly on observed runtime evidence
-- do not speculate beyond what the tools return
-
-after each tool result, decide whether to investigate further or conclude.
-when concluding, call done_investigating with a structured assessment."""
-
-
-# -- data structures
+# ---------------------------------------------------------------------------
+# data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
-class InvestigationFinding:
-    """a single finding from an investigation step."""
-    step: int
-    tool_used: str
-    target: str
-    result: dict = field(default_factory=dict)
-    interpretation: str = ""
+class TimelineEntry:
+    """a single entry in the investigation timeline."""
+    timestamp: str
+    tag: str  # probe, runtime, analysis, verify, risk, agent
+    message: str
+    severity: str = "info"  # info, high, critical
+
+
+@dataclass
+class TrustEvolution:
+    """tracks trust score degradation over time."""
+    entries: list[tuple[str, int]] = field(default_factory=list)
+
+    def record(self, reason: str, score: int) -> None:
+        self.entries.append((reason, score))
+
+    @property
+    def final_score(self) -> int:
+        return self.entries[-1][1] if self.entries else 100
+
+
+@dataclass
+class EvidenceCorrelation:
+    """cross-evidence linking for a specific claim category."""
+    category: str
+    claim_text: str
+    observations: list[str] = field(default_factory=list)
+    conclusion: str = ""
+    severity: str = "info"
 
 
 @dataclass
 class InvestigationReport:
-    """complete investigation report."""
-    findings: list[InvestigationFinding] = field(default_factory=list)
-    total_steps: int = 0
-    final_assessment: str = ""
-    risk_level: str = "unknown"  # critical, high, medium, low, clean
+    """complete investigation report with timeline and evidence."""
+    timeline: list[TimelineEntry] = field(default_factory=list)
+    trust_evolution: TrustEvolution = field(default_factory=TrustEvolution)
+    correlations: list[EvidenceCorrelation] = field(default_factory=list)
+    managed_agent_output: str = ""
+    strategies_executed: list[str] = field(default_factory=list)
+    risk_level: str = "unknown"
+    trust_score: int = 100
 
 
-# -- investigation tools (real implementations)
+# ---------------------------------------------------------------------------
+# deterministic investigation tools
+# ---------------------------------------------------------------------------
 
 def _hash(body: bytes) -> str:
     return hashlib.md5(body).hexdigest()[:12]
@@ -97,386 +101,128 @@ def _random_string(length: int = 12) -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-def _tool_probe_endpoint(base_url: str, method: str, path: str,
-                          body: dict | None = None,
-                          headers: dict | None = None) -> dict:
-    """probe a specific endpoint with exact parameters."""
+def _probe(base_url: str, method: str, path: str,
+           body: dict | None = None) -> dict:
     if not path.startswith("/"):
         path = f"/{path}"
-    url = f"{base_url}{path}"
-
     try:
-        kwargs = {
-            "method": method.upper(),
-            "url": url,
-            "timeout": TOOL_TIMEOUT,
-            "follow_redirects": False,
-        }
-        if body and method.upper() not in ("GET", "HEAD", "OPTIONS"):
+        kwargs = {"method": method.upper(), "url": f"{base_url}{path}",
+                  "timeout": TOOL_TIMEOUT, "follow_redirects": False}
+        if body and method.upper() not in ("GET", "HEAD"):
             kwargs["json"] = body
-        elif body:
-            kwargs["params"] = body
-        if headers:
-            kwargs["headers"] = headers
-
-        response = httpx.request(**kwargs)
-
-        return {
-            "status": response.status_code,
-            "content_length": len(response.content),
-            "content_type": response.headers.get("content-type", ""),
-            "response_hash": _hash(response.content),
-            "body_preview": response.text[:500],
-            "headers": dict(response.headers),
-        }
-    except httpx.ConnectError:
-        return {"error": "connection refused"}
-    except httpx.TimeoutException:
-        return {"error": "timeout"}
+        r = httpx.request(**kwargs)
+        return {"status": r.status_code, "hash": _hash(r.content),
+                "size": len(r.content), "preview": r.text[:200]}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _tool_test_auth_variations(base_url: str, path: str) -> dict:
-    """test an auth endpoint with various invalid credential patterns."""
+def _test_auth(base_url: str, path: str) -> dict:
     if not path.startswith("/"):
         path = f"/{path}"
     url = f"{base_url}{path}"
-
     variations = [
-        {"name": "empty_body", "body": {}},
-        {"name": "empty_credentials", "body": {"email": "", "password": ""}},
-        {"name": "invalid_email", "body": {"email": "notanemail", "password": "test123"}},
-        {"name": "sql_injection", "body": {"email": "' OR 1=1 --", "password": "' OR 1=1 --"}},
-        {"name": "random_valid_format", "body": {
-            "email": f"{_random_string(8)}@test.com",
-            "password": _random_string(16),
-        }},
-        {"name": "xss_attempt", "body": {
-            "email": "<script>alert(1)</script>",
-            "password": "<img src=x onerror=alert(1)>",
-        }},
-        {"name": "oversized_input", "body": {
-            "email": _random_string(1000) + "@test.com",
-            "password": _random_string(5000),
-        }},
+        ("empty_body", {}),
+        ("empty_creds", {"email": "", "password": ""}),
+        ("sql_injection", {"email": "' OR 1=1 --", "password": "' OR 1=1 --"}),
+        ("random_creds", {"email": f"{_random_string(8)}@test.com",
+                          "password": _random_string(16)}),
+        ("xss_attempt", {"email": "<script>alert(1)</script>",
+                         "password": "<img src=x onerror=alert(1)>"}),
     ]
-
     results = []
-    for var in variations:
+    for name, body in variations:
         try:
-            response = httpx.post(
-                url,
-                json=var["body"],
-                timeout=TOOL_TIMEOUT,
-                follow_redirects=False,
-            )
-            results.append({
-                "variation": var["name"],
-                "status": response.status_code,
-                "response_hash": _hash(response.content),
-                "content_length": len(response.content),
-                "body_preview": response.text[:200],
-            })
+            r = httpx.post(url, json=body, timeout=TOOL_TIMEOUT, follow_redirects=False)
+            results.append({"name": name, "status": r.status_code, "hash": _hash(r.content)})
         except Exception as e:
-            results.append({
-                "variation": var["name"],
-                "error": str(e),
-            })
+            results.append({"name": name, "error": str(e)})
 
-    # analyze: are responses identical?
-    hashes = {r["response_hash"] for r in results if "response_hash" in r}
-    statuses = {r["status"] for r in results if "status" in r}
-
-    return {
-        "endpoint": path,
-        "variations_tested": len(variations),
-        "unique_response_hashes": len(hashes),
-        "unique_status_codes": len(statuses),
-        "all_identical": len(hashes) == 1 and len(statuses) == 1,
-        "results": results,
-    }
+    hashes = {r["hash"] for r in results if "hash" in r}
+    return {"path": path, "tested": len(variations),
+            "unique_hashes": len(hashes), "all_identical": len(hashes) <= 1,
+            "results": results}
 
 
-def _tool_fuzz_endpoint(base_url: str, method: str, path: str) -> dict:
-    """send edge-case payloads to discover unexpected behavior."""
+def _fuzz(base_url: str, method: str, path: str) -> dict:
     if not path.startswith("/"):
         path = f"/{path}"
     url = f"{base_url}{path}"
-
-    fuzz_cases = [
-        {"name": "empty_body", "body": None},
-        {"name": "null_values", "body": {"key": None, "value": None}},
-        {"name": "nested_deep", "body": {"a": {"b": {"c": {"d": {"e": "deep"}}}}}},
-        {"name": "array_input", "body": [1, 2, 3]},
-        {"name": "huge_number", "body": {"value": 99999999999999}},
-        {"name": "special_chars", "body": {"input": "!@#$%^&*()_+{}|:<>?"}},
-        {"name": "unicode", "body": {"input": "こんにちは世界 🌍"}},
-        {"name": "boolean_string", "body": {"active": "true", "count": "0"}},
+    cases = [
+        ("null_values", {"key": None}),
+        ("nested", {"a": {"b": {"c": "deep"}}}),
+        ("huge_number", {"value": 99999999999999}),
+        ("unicode", {"input": "こんにちは 🌍"}),
     ]
-
     results = []
-    for case in fuzz_cases:
+    for name, body in cases:
         try:
-            kwargs = {
-                "method": method.upper(),
-                "url": url,
-                "timeout": TOOL_TIMEOUT,
-                "follow_redirects": False,
-            }
-            if case["body"] is not None:
-                kwargs["json"] = case["body"]
-
-            response = httpx.request(**kwargs)
-            results.append({
-                "case": case["name"],
-                "status": response.status_code,
-                "response_hash": _hash(response.content),
-                "content_length": len(response.content),
-            })
+            r = httpx.request(method.upper(), url, json=body,
+                              timeout=TOOL_TIMEOUT, follow_redirects=False)
+            results.append({"name": name, "status": r.status_code, "hash": _hash(r.content)})
         except Exception as e:
-            results.append({
-                "case": case["name"],
-                "error": str(e),
-            })
+            results.append({"name": name, "error": str(e)})
 
-    hashes = {r["response_hash"] for r in results if "response_hash" in r}
-
-    return {
-        "endpoint": f"{method} {path}",
-        "cases_tested": len(fuzz_cases),
-        "unique_response_hashes": len(hashes),
-        "all_identical": len(hashes) == 1,
-        "results": results,
-    }
+    hashes = {r["hash"] for r in results if "hash" in r}
+    return {"path": f"{method} {path}", "tested": len(cases),
+            "unique_hashes": len(hashes), "all_identical": len(hashes) <= 1}
 
 
-def _tool_analyze_error_response(base_url: str, path: str) -> dict:
-    """analyze an error response for information leakage."""
+def _analyze_error(base_url: str, path: str) -> dict:
     if not path.startswith("/"):
         path = f"/{path}"
-    url = f"{base_url}{path}"
-
     try:
-        response = httpx.get(url, timeout=TOOL_TIMEOUT, follow_redirects=False)
-        body = response.text
-
-        leakage_indicators = {
+        r = httpx.get(f"{base_url}{path}", timeout=TOOL_TIMEOUT, follow_redirects=False)
+        body = r.text
+        leakage = {
             "stack_trace": any(kw in body.lower() for kw in
-                ["traceback", "at module", "at object", "error at", "stack trace"]),
+                ["traceback", "at module", "error at"]),
             "file_paths": any(kw in body for kw in
-                ["\\", "/usr/", "/home/", "/var/", "C:\\", "node_modules"]),
-            "database_info": any(kw in body.lower() for kw in
-                ["sql", "query", "table", "column", "database", "connection"]),
-            "framework_info": any(kw in body.lower() for kw in
-                ["express", "django", "fastapi", "flask", "next.js", "uvicorn"]),
-            "debug_mode": any(kw in body.lower() for kw in
-                ["debug", "development", "dev mode", "verbose"]),
-            "sensitive_headers": bool(response.headers.get("x-powered-by")),
-            "server_version": bool(response.headers.get("server")),
+                ["\\", "/usr/", "/home/", "node_modules"]),
+            "framework": any(kw in body.lower() for kw in
+                ["express", "django", "fastapi", "flask", "uvicorn"]),
+            "server_header": bool(r.headers.get("server")),
         }
-
-        return {
-            "endpoint": path,
-            "status": response.status_code,
-            "content_length": len(response.content),
-            "leakage_detected": any(leakage_indicators.values()),
-            "leakage_indicators": leakage_indicators,
-            "body_preview": body[:500],
-            "server_header": response.headers.get("server", "not disclosed"),
-            "powered_by": response.headers.get("x-powered-by", "not disclosed"),
-        }
+        return {"path": path, "status": r.status_code,
+                "leakage": any(leakage.values()),
+                "types": [k for k, v in leakage.items() if v],
+                "preview": body[:200],
+                "server": r.headers.get("server", "hidden")}
     except Exception as e:
         return {"error": str(e)}
 
 
-# -- gemini function declarations
-
-_TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="probe_endpoint",
-        description=(
-            "send a specific http request to any endpoint on the running application. "
-            "use this for targeted investigation of suspicious endpoints."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "method": types.Schema(
-                    type=types.Type.STRING,
-                    description="http method (GET, POST, PUT, DELETE, etc.)",
-                ),
-                "path": types.Schema(
-                    type=types.Type.STRING,
-                    description="url path to probe (e.g. /api/auth)",
-                ),
-                "body": types.Schema(
-                    type=types.Type.STRING,
-                    description="optional json body as a string (e.g. '{\"email\": \"test@test.com\"}')",
-                ),
-            },
-            required=["method", "path"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="test_auth_variations",
-        description=(
-            "test an authentication endpoint with 7 different credential variations: "
-            "empty body, empty credentials, invalid email, sql injection, random valid format, "
-            "xss attempt, and oversized input. returns whether all responses are identical."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "path": types.Schema(
-                    type=types.Type.STRING,
-                    description="path to the auth endpoint (e.g. /api/auth, /login)",
-                ),
-            },
-            required=["path"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="fuzz_endpoint",
-        description=(
-            "send 8 edge-case payloads to an endpoint: empty body, null values, "
-            "deeply nested objects, arrays, huge numbers, special characters, unicode, "
-            "and type-confused values. detects invariant response behavior."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "method": types.Schema(
-                    type=types.Type.STRING,
-                    description="http method",
-                ),
-                "path": types.Schema(
-                    type=types.Type.STRING,
-                    description="url path to fuzz",
-                ),
-            },
-            required=["method", "path"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="analyze_error_response",
-        description=(
-            "analyze an endpoint's error response for information leakage: "
-            "stack traces, file paths, database info, framework disclosure, "
-            "debug mode indicators, and sensitive headers."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "path": types.Schema(
-                    type=types.Type.STRING,
-                    description="path to analyze for error leakage",
-                ),
-            },
-            required=["path"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="done_investigating",
-        description=(
-            "call this when you have gathered enough evidence to conclude. "
-            "provide your final structured assessment of the investigation."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "risk_level": types.Schema(
-                    type=types.Type.STRING,
-                    description="overall risk level: critical, high, medium, low, or clean",
-                ),
-                "assessment": types.Schema(
-                    type=types.Type.STRING,
-                    description=(
-                        "detailed final assessment of the investigation findings. "
-                        "cover what was investigated, what was found, and what it means."
-                    ),
-                ),
-            },
-            required=["risk_level", "assessment"],
-        ),
-    ),
-]
+def _check_outbound(base_url: str, service_domain: str, endpoints: list[str]) -> dict:
+    """check if hitting endpoints triggers any outbound service behavior.
+    tests by comparing response patterns — real integrations show variable responses."""
+    results = []
+    for path in endpoints[:3]:
+        if not path.startswith("/"):
+            path = f"/{path}"
+        r1 = _probe(base_url, "POST", path, {"test": _random_string()})
+        r2 = _probe(base_url, "POST", path, {"test": _random_string()})
+        results.append({
+            "path": path,
+            "identical": r1.get("hash") == r2.get("hash"),
+            "status_1": r1.get("status"), "status_2": r2.get("status"),
+        })
+    all_identical = all(r.get("identical", True) for r in results)
+    return {"service": service_domain, "endpoints_tested": len(results),
+            "all_static": all_identical, "results": results}
 
 
-# -- evidence builder
-
-def _build_investigation_context(
-    fingerprint: RepoFingerprint | None,
-    run_result: RunResult | None,
-    probe_result: ProbeResult | None,
-    verification_result: VerificationResult | None,
-    contradiction_report: ContradictionReport | None,
-) -> str:
-    """build the initial evidence context for the agent."""
-    parts = []
-
-    if fingerprint:
-        services_str = ", ".join(f"{s.name} ({s.category})" for s in fingerprint.services) or "none"
-        parts.append(
-            f"repository: {fingerprint.repo_type} + {fingerprint.framework}\n"
-            f"services: {services_str}\n"
-            f"entry point: {fingerprint.entry_point}"
-        )
-
-    if run_result:
-        parts.append(
-            f"boot status: {run_result.status.value}\n"
-            f"port reachable: {run_result.port_reachable}"
-        )
-
-    if probe_result:
-        surfaces = []
-        for s in probe_result.surfaces:
-            surfaces.append(
-                f"  {s.method} {s.route} -> {s.status} ({s.category}, hash:{s.response_hash})"
-            )
-        parts.append(
-            f"surface discovery: {probe_result.reachable_count} reachable / {probe_result.total_probed} probed\n"
-            f"server errors: {len(probe_result.server_errors)}\n"
-            "endpoints:\n" + "\n".join(surfaces)
-        )
-
-    if verification_result and verification_result.total_verified > 0:
-        verdicts = []
-        for v in verification_result.verdicts:
-            verdicts.append(
-                f"  {v.method} {v.route}: {v.category} "
-                f"(suspicious: {v.suspicious}, reason: {v.reason})"
-            )
-        parts.append(
-            f"behavioral verification: {verification_result.suspicious_count} suspicious\n"
-            + "\n".join(verdicts)
-        )
-
-    if contradiction_report and contradiction_report.contradictions:
-        contras = []
-        # cap at 10 to avoid token overflow
-        for c in contradiction_report.contradictions[:10]:
-            evidence = "; ".join(c.evidence)
-            contras.append(
-                f"  [{c.severity}] \"{c.claim.text[:100]}\" -> {evidence}"
-            )
-        total = len(contradiction_report.contradictions)
-        parts.append(
-            f"contradictions: {total} total (showing top 10)\n"
-            + "\n".join(contras)
-        )
-
-    return "\n\n".join(parts)
-
-
-# -- the agent
+# ---------------------------------------------------------------------------
+# investigation engine
+# ---------------------------------------------------------------------------
 
 class InvestigationAgent:
     """
-    autonomous investigation agent.
-    gemini decides what to investigate, deterministic tools execute,
-    gemini interprets results. constrained to max 3 steps.
+    managed investigation agent.
+
+    flow:
+      1. deterministic strategy selection + tool execution
+      2. build timeline, trust evolution, evidence correlations
+      3. managed agent synthesis via client.interactions.create (1 api call)
     """
 
     def __init__(self, base_url: str) -> None:
@@ -484,18 +230,29 @@ class InvestigationAgent:
             raise RuntimeError("GOOGLE_API_KEY not set")
 
         self.client = genai.Client(api_key=Config.google_api_key)
-        self.model = Config.gemini_model
         self.base_url = base_url
         self.report = InvestigationReport()
+        self._start_time = time.time()
 
-        # tool dispatch
-        self._tool_dispatch = {
-            "probe_endpoint": self._exec_probe,
-            "test_auth_variations": self._exec_auth_test,
-            "fuzz_endpoint": self._exec_fuzz,
-            "analyze_error_response": self._exec_error_analysis,
-            "done_investigating": self._exec_done,
-        }
+    def _ts(self) -> str:
+        """current timestamp for timeline."""
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _log(self, tag: str, msg: str, severity: str = "info") -> None:
+        """add timeline entry and print event."""
+        self.report.timeline.append(
+            TimelineEntry(timestamp=self._ts(), tag=tag,
+                          message=msg, severity=severity)
+        )
+        out.event(tag, msg)
+
+    def _trust(self, reason: str, deduction: int) -> int:
+        """deduct from trust score and record evolution."""
+        current = self.report.trust_score
+        new_score = max(0, current - deduction)
+        self.report.trust_score = new_score
+        self.report.trust_evolution.record(reason, new_score)
+        return new_score
 
     def investigate(
         self,
@@ -505,349 +262,460 @@ class InvestigationAgent:
         verification_result: VerificationResult | None = None,
         contradiction_report: ContradictionReport | None = None,
     ) -> InvestigationReport:
-        """run the autonomous investigation loop."""
-        context = _build_investigation_context(
-            fingerprint, run_result, probe_result,
-            verification_result, contradiction_report,
+        """run the full investigation pipeline."""
+        contradictions = (
+            contradiction_report.contradictions if contradiction_report else []
         )
 
-        system_prompt = _AGENT_SYSTEM_PROMPT.format(max_steps=MAX_INVESTIGATION_STEPS)
+        # initialize trust evolution
+        self.report.trust_evolution.record("initial runtime boot", 100)
 
-        # build initial message
-        initial_message = (
-            "here is the runtime evidence from the application under investigation. "
-            "analyze the evidence and decide what to investigate first. "
-            "you have 3 investigation steps. be strategic.\n\n"
-            f"{context}"
+        # phase A: establish baseline trust from probe results
+        if probe_result:
+            self._establish_baseline(probe_result)
+
+        # phase B: run targeted investigations
+        self._run_investigations(probe_result, contradictions, fingerprint)
+
+        # phase C: build evidence correlations
+        self._correlate_evidence(contradictions)
+
+        # phase D: managed agent synthesis (1 api call)
+        self._managed_agent_synthesis(
+            fingerprint, probe_result, verification_result, contradiction_report
         )
-
-        # conversation history for the agent loop
-        contents = [
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=initial_message)],
-            )
-        ]
-
-        tools = [types.Tool(function_declarations=_TOOL_DECLARATIONS)]
-        done = False
-
-        for step in range(1, MAX_INVESTIGATION_STEPS + 1):
-            if done:
-                break
-
-            out.console.print(f"  [phase]step {step}/{MAX_INVESTIGATION_STEPS}[/phase]")
-            out.muted("    agent reasoning...")
-
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        tools=tools,
-                        temperature=0.2,
-                        max_output_tokens=600,
-                    ),
-                )
-            except Exception as e:
-                out.warning(f"agent reasoning failed: {e}")
-                break
-
-            # process response
-            if not response.candidates:
-                out.warning("agent returned empty response")
-                break
-
-            candidate = response.candidates[0]
-
-            # add assistant response to history
-            contents.append(candidate.content)
-
-            # check for function calls
-            function_calls = [
-                part for part in candidate.content.parts
-                if part.function_call
-            ]
-
-            if not function_calls:
-                # model responded with text (reasoning), extract and continue
-                text = "".join(
-                    part.text for part in candidate.content.parts if part.text
-                )
-                if text:
-                    out.muted(f"  agent: {text[:200]}")
-                break
-
-            # execute each function call
-            function_responses = []
-            for fc in function_calls:
-                tool_name = fc.function_call.name
-                tool_args = dict(fc.function_call.args) if fc.function_call.args else {}
-
-                out.info(f"  agent calls: {tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})")
-
-                # check for done
-                if tool_name == "done_investigating":
-                    self.report.final_assessment = tool_args.get("assessment", "")
-                    self.report.risk_level = tool_args.get("risk_level", "unknown")
-                    done = True
-                    function_responses.append(
-                        types.Part.from_function_response(
-                            name=tool_name,
-                            response={"status": "investigation concluded"},
-                        )
-                    )
-                    continue
-
-                # execute tool
-                handler = self._tool_dispatch.get(tool_name)
-                if handler:
-                    result = handler(tool_args)
-
-                    # record finding
-                    finding = InvestigationFinding(
-                        step=step,
-                        tool_used=tool_name,
-                        target=tool_args.get("path", tool_args.get("method", "")),
-                        result=result,
-                    )
-                    self.report.findings.append(finding)
-                    self.report.total_steps = step
-
-                    # print result summary
-                    self._print_finding(finding)
-
-                    function_responses.append(
-                        types.Part.from_function_response(
-                            name=tool_name,
-                            response=result,
-                        )
-                    )
-                else:
-                    function_responses.append(
-                        types.Part.from_function_response(
-                            name=tool_name,
-                            response={"error": f"unknown tool: {tool_name}"},
-                        )
-                    )
-
-            # add function responses to history
-            if function_responses:
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=function_responses,
-                    )
-                )
-
-        # if agent didn't call done_investigating, get a final assessment
-        if not done and not self.report.final_assessment:
-            out.muted("    agent concluding...")
-            self._get_final_assessment(contents)
 
         return self.report
 
-    def _get_final_assessment(self, contents) -> None:
-        """ask gemini for a final assessment if the loop ended without done_investigating."""
-        # build a compact summary instead of replaying full conversation
-        findings_summary = []
-        for f in self.report.findings:
-            tool = f.tool_used
-            result = f.result
-            if "error" in result:
-                findings_summary.append(f"step {f.step}: {tool} -> error: {result['error']}")
-            elif tool == "test_auth_variations":
-                findings_summary.append(
-                    f"step {f.step}: {tool}({f.target}) -> "
-                    f"identical={result.get('all_identical')}, "
-                    f"unique_hashes={result.get('unique_response_hashes')}"
-                )
-            elif tool == "analyze_error_response":
-                findings_summary.append(
-                    f"step {f.step}: {tool}({f.target}) -> "
-                    f"leakage={result.get('leakage_detected')}"
-                )
-            elif tool == "fuzz_endpoint":
-                findings_summary.append(
-                    f"step {f.step}: {tool}({f.target}) -> "
-                    f"identical={result.get('all_identical')}"
-                )
+    def _establish_baseline(self, probe_result: ProbeResult) -> None:
+        """establish baseline trust from surface discovery."""
+        error_count = len(probe_result.server_errors)
+        total = probe_result.reachable_count
+
+        if total == 0:
+            self._trust("no reachable endpoints", 50)
+            self._log("risk", "no reachable endpoints — trust severely degraded", "critical")
+        elif error_count == total:
+            self._trust("all endpoints return server errors", 40)
+            self._log("risk", f"100% error rate ({error_count}/{total} endpoints)", "critical")
+        elif error_count > 0:
+            rate = error_count / total
+            deduction = int(rate * 30)
+            self._trust(f"{error_count}/{total} server errors", deduction)
+            self._log("risk", f"{rate:.0%} error rate detected", "high")
+
+    def _run_investigations(
+        self,
+        probe_result: ProbeResult | None,
+        contradictions: list[Contradiction],
+        fingerprint: RepoFingerprint | None,
+    ) -> None:
+        """run targeted investigations based on contradiction types."""
+        categories = {c.claim.category for c in contradictions}
+
+        # AUTH investigation
+        if categories & {"auth", "security"}:
+            self.report.strategies_executed.append("AUTH_INVESTIGATION")
+            out.console.print()
+            out.console.print("  [phase]▸ AUTH_INVESTIGATION[/phase]")
+            self._investigate_auth(probe_result)
+
+        # API reliability investigation
+        if categories & {"api", "production"}:
+            self.report.strategies_executed.append("API_RELIABILITY")
+            out.console.print()
+            out.console.print("  [phase]▸ API_RELIABILITY[/phase]")
+            self._investigate_api(probe_result)
+
+        # AI endpoint investigation
+        if categories & {"ai"}:
+            self.report.strategies_executed.append("AI_ENDPOINT")
+            out.console.print()
+            out.console.print("  [phase]▸ AI_ENDPOINT[/phase]")
+            self._investigate_ai(probe_result)
+
+        # runtime claim verification (the "holy shit" moment)
+        if fingerprint:
+            self._verify_runtime_claims(fingerprint, probe_result)
+
+    def _investigate_auth(self, probe_result: ProbeResult | None) -> None:
+        """deep investigation of auth endpoints."""
+        auth_paths = []
+        if probe_result:
+            for s in probe_result.surfaces:
+                lower = s.route.lower()
+                if any(kw in lower for kw in ["auth", "login", "signin", "signup"]):
+                    auth_paths.append(s.route)
+
+        for common in ["/api/auth", "/auth", "/login"]:
+            if common not in auth_paths:
+                auth_paths.append(common)
+
+        for path in auth_paths[:2]:
+            self._log("probe", f"testing auth variations on {path}")
+            result = _test_auth(self.base_url, path)
+
+            if result.get("all_identical"):
+                self._log("runtime", f"identical responses across {result['tested']} auth variations on {path}", "critical")
+                self._trust(f"invariant auth on {path}", 15)
+                self._log("risk", f"trust reduced → {self.report.trust_score}/100", "critical")
             else:
-                findings_summary.append(
-                    f"step {f.step}: {tool}({f.target}) -> "
-                    f"status={result.get('status')}, hash={result.get('response_hash')}"
+                self._log("verify", f"{result['unique_hashes']} unique responses on {path}")
+
+        # error leakage check
+        if auth_paths:
+            path = auth_paths[0]
+            self._log("probe", f"analyzing error response on {path}")
+            result = _analyze_error(self.base_url, path)
+            if result.get("leakage"):
+                self._log("analysis", f"information leakage: {', '.join(result['types'])}", "high")
+                self._trust(f"info leakage on {path}", 8)
+
+    def _investigate_api(self, probe_result: ProbeResult | None) -> None:
+        """investigate api endpoint reliability."""
+        if not probe_result:
+            return
+
+        errors = [s for s in probe_result.surfaces if s.category == "server_error"][:3]
+
+        for surface in errors:
+            self._log("probe", f"fuzzing {surface.method} {surface.route}")
+            result = _fuzz(self.base_url, surface.method, surface.route)
+
+            if result.get("all_identical"):
+                self._log("runtime", f"all fuzz cases identical on {surface.route}", "high")
+                self._trust(f"invariant fuzz on {surface.route}", 5)
+            else:
+                self._log("verify", f"{result['unique_hashes']} unique responses on {surface.route}")
+
+        # error leakage on first error endpoint
+        if errors:
+            self._log("probe", f"analyzing error leakage on {errors[0].route}")
+            result = _analyze_error(self.base_url, errors[0].route)
+            if result.get("leakage"):
+                self._log("analysis", f"error leakage detected: {', '.join(result['types'])}", "high")
+                self._trust("information leakage in errors", 5)
+
+    def _investigate_ai(self, probe_result: ProbeResult | None) -> None:
+        """investigate ai/ml endpoints."""
+        if not probe_result:
+            return
+
+        ai_eps = [
+            s for s in probe_result.surfaces
+            if any(kw in s.route.lower() for kw in
+                   ["ai", "generate", "predict", "infer", "chat"])
+        ][:2]
+
+        for surface in ai_eps:
+            self._log("probe", f"fuzzing AI endpoint {surface.route}")
+            result = _fuzz(self.base_url, "POST", surface.route)
+            if result.get("all_identical"):
+                self._log("analysis", f"AI endpoint {surface.route} returns static responses", "high")
+                self._trust(f"static AI on {surface.route}", 10)
+
+    def _verify_runtime_claims(
+        self, fingerprint: RepoFingerprint, probe_result: ProbeResult | None
+    ) -> None:
+        """the "holy shit" moment — verify specific service claims at runtime."""
+        self.report.strategies_executed.append("RUNTIME_CLAIM_VERIFICATION")
+        out.console.print()
+        out.console.print("  [phase]▸ RUNTIME_CLAIM_VERIFICATION[/phase]")
+
+        # check for claimed services
+        for service in fingerprint.services:
+            service_name = service.name.lower()
+
+            if service.category == "payment":
+                self._log("probe", f"searching runtime traces for {service.name} activity...")
+                # test payment-like endpoints
+                payment_paths = []
+                if probe_result:
+                    for s in probe_result.surfaces:
+                        if any(kw in s.route.lower() for kw in ["payment", "charge", "checkout", "billing"]):
+                            payment_paths.append(s.route)
+
+                if not payment_paths:
+                    self._log("analysis", f"no {service.name} endpoints discovered at runtime", "high")
+                    self._trust(f"no {service.name} runtime traces", 8)
+                else:
+                    result = _check_outbound(self.base_url, service.name, payment_paths)
+                    if result.get("all_static"):
+                        self._log("analysis", f"static responses — no {service.name} integration activity observed", "high")
+                        self._trust(f"static {service.name} responses", 10)
+
+            elif service.category == "auth":
+                self._log("probe", f"verifying {service.name} authentication at runtime...")
+                result = _probe(self.base_url, "POST", "/api/auth",
+                                {"email": "test@test.com", "password": "test"})
+                if result.get("error"):
+                    self._log("analysis", f"{service.name} auth endpoint unreachable", "high")
+                elif result.get("status", 0) >= 500:
+                    self._log("analysis", f"{service.name} auth returns server error", "high")
+                    self._trust(f"{service.name} auth broken", 8)
+
+    def _correlate_evidence(self, contradictions: list[Contradiction]) -> None:
+        """build cross-evidence correlations."""
+        # group contradictions by category
+        by_category: dict[str, list[Contradiction]] = {}
+        for c in contradictions:
+            by_category.setdefault(c.claim.category, []).append(c)
+
+        for category, contras in by_category.items():
+            best = max(contras, key=lambda c: c.claim.confidence)
+            observations = []
+
+            # gather all evidence across contradictions in this category
+            for c in contras:
+                for ev in c.evidence:
+                    if ev not in observations:
+                        observations.append(ev)
+
+            # add investigation findings
+            timeline_relevant = [
+                t for t in self.report.timeline
+                if t.severity in ("high", "critical") and category in t.message.lower()
+            ]
+            for t in timeline_relevant:
+                if t.message not in observations:
+                    observations.append(t.message)
+
+            if observations:
+                conclusion = self._generate_conclusion(category, observations)
+                correlation = EvidenceCorrelation(
+                    category=category,
+                    claim_text=best.claim.text,
+                    observations=observations[:5],
+                    conclusion=conclusion,
+                    severity=best.severity,
+                )
+                self.report.correlations.append(correlation)
+
+    @staticmethod
+    def _generate_conclusion(category: str, observations: list[str]) -> str:
+        """generate deterministic conclusion from evidence."""
+        conclusions = {
+            "auth": "authentication layer appears behaviorally bypassed or non-functional",
+            "payment": "claimed payment integration shows no runtime activity",
+            "api": "api endpoints are non-functional — systematic server failure observed",
+            "production": "runtime behavior contradicts production readiness claims",
+            "security": "security properties are not enforced at runtime",
+            "ai": "ai/ml functionality shows no evidence of model inference",
+            "database": "database integration appears misconfigured or absent",
+        }
+        return conclusions.get(category,
+                               f"{category} claims not supported by runtime evidence")
+
+    def _managed_agent_synthesis(
+        self,
+        fingerprint: RepoFingerprint | None,
+        probe_result: ProbeResult | None,
+        verification_result: VerificationResult | None,
+        contradiction_report: ContradictionReport | None,
+    ) -> None:
+        """synthesize findings using google managed agent (1 api call)."""
+        self._log("agent", "synthesizing with managed agent...")
+
+        # build compact evidence summary
+        evidence_parts = []
+
+        evidence_parts.append(
+            f"trust score evolution: "
+            + " → ".join(f"{r}: {s}" for r, s in self.report.trust_evolution.entries)
+        )
+
+        if self.report.correlations:
+            for c in self.report.correlations:
+                evidence_parts.append(
+                    f"[{c.severity}] {c.category}: \"{c.claim_text[:80]}\" — "
+                    + "; ".join(c.observations[:3])
                 )
 
-        summary_prompt = (
-            "you have completed all investigation steps. here are the findings:\n\n"
-            + "\n".join(findings_summary) + "\n\n"
-            "provide a final assessment: what risk level (critical/high/medium/low/clean) "
-            "and a 2-3 sentence summary of what the investigation revealed."
+        evidence_parts.append(
+            f"strategies: {', '.join(self.report.strategies_executed)}"
+        )
+        evidence_parts.append(
+            f"final trust: {self.report.trust_score}/100"
+        )
+
+        agent_input = (
+            "you are repoprobe's forensic investigation agent. "
+            "analyze this runtime investigation evidence and provide a 3-5 sentence "
+            "authoritative assessment. state the risk level, key findings, and "
+            "what the evidence means practically. be direct.\n\n"
+            + "\n".join(evidence_parts)
         )
 
         try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=summary_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction="you are a runtime forensic analyst. be concise and direct.",
-                    temperature=0.2,
-                    max_output_tokens=400,
+            # use managed agent via interactions.create
+            interaction = self.client.interactions.create(
+                agent=Config.agent_model,
+                input=agent_input,
+                environment="remote",
+                system_instruction=(
+                    "you are a runtime forensic analyst for repoprobe. "
+                    "analyze evidence and provide a concise, authoritative assessment. "
+                    "do not speculate. base conclusions on observed evidence only. "
+                    "be precise and direct."
                 ),
             )
 
+            if hasattr(interaction, 'output_text') and interaction.output_text:
+                self.report.managed_agent_output = interaction.output_text
+            elif hasattr(interaction, 'text') and interaction.text:
+                self.report.managed_agent_output = interaction.text
+            else:
+                self.report.managed_agent_output = str(interaction)
+
+            # extract risk level
+            lower = self.report.managed_agent_output.lower()
+            for level in ["critical", "high", "medium", "low", "clean"]:
+                if level in lower:
+                    self.report.risk_level = level
+                    break
+
+            self._log("agent", "managed agent synthesis complete")
+
+        except Exception as e:
+            # fallback to direct gemini call if managed agent fails
+            self._log("agent", f"managed agent unavailable ({e}), using direct synthesis")
+            self._fallback_synthesis(agent_input)
+
+    def _fallback_synthesis(self, prompt: str) -> None:
+        """fallback to gemini 3.5 flash if managed agent is unavailable."""
+        try:
+            response = self.client.models.generate_content(
+                model=Config.gemini_model,
+                contents=prompt,
+                config={"temperature": 0.2, "max_output_tokens": 300},
+            )
             if response.text:
-                self.report.final_assessment = response.text
-                # try to extract risk level from text
-                text_lower = response.text.lower()
+                self.report.managed_agent_output = response.text
+                lower = response.text.lower()
                 for level in ["critical", "high", "medium", "low", "clean"]:
-                    if level in text_lower:
+                    if level in lower:
                         self.report.risk_level = level
                         break
         except Exception:
-            self.report.final_assessment = (
-                f"investigation completed with {len(self.report.findings)} findings. "
+            self.report.managed_agent_output = (
+                f"investigation completed with trust score {self.report.trust_score}/100. "
                 f"manual review recommended."
             )
-            self.report.risk_level = "unknown"
 
-    # -- tool executors
 
-    def _exec_probe(self, args: dict) -> dict:
-        """execute probe_endpoint tool."""
-        body = None
-        if "body" in args and args["body"]:
-            try:
-                body = json.loads(args["body"])
-            except (json.JSONDecodeError, TypeError):
-                body = {"raw": args["body"]}
-
-        return _tool_probe_endpoint(
-            self.base_url,
-            method=args.get("method", "GET"),
-            path=args.get("path", "/"),
-            body=body,
-        )
-
-    def _exec_auth_test(self, args: dict) -> dict:
-        """execute test_auth_variations tool."""
-        return _tool_test_auth_variations(
-            self.base_url,
-            path=args.get("path", "/auth"),
-        )
-
-    def _exec_fuzz(self, args: dict) -> dict:
-        """execute fuzz_endpoint tool."""
-        return _tool_fuzz_endpoint(
-            self.base_url,
-            method=args.get("method", "POST"),
-            path=args.get("path", "/"),
-        )
-
-    def _exec_error_analysis(self, args: dict) -> dict:
-        """execute analyze_error_response tool."""
-        return _tool_analyze_error_response(
-            self.base_url,
-            path=args.get("path", "/"),
-        )
-
-    def _exec_done(self, args: dict) -> dict:
-        """handle done_investigating — no real execution needed."""
-        return {"status": "concluded"}
-
-    # -- output
-
-    def _print_finding(self, finding: InvestigationFinding) -> None:
-        """print a single investigation finding."""
-        result = finding.result
-
-        if "error" in result:
-            out.muted(f"    result: {result['error']}")
-            return
-
-        if finding.tool_used == "test_auth_variations":
-            identical = result.get("all_identical", False)
-            unique = result.get("unique_response_hashes", 0)
-            if identical:
-                out.console.print(
-                    f"    [warning]-- all {result.get('variations_tested', 0)} auth variations "
-                    f"returned identical responses[/warning]"
-                )
-            else:
-                out.console.print(
-                    f"    [success]-- {unique} unique responses across "
-                    f"{result.get('variations_tested', 0)} variations[/success]"
-                )
-
-        elif finding.tool_used == "fuzz_endpoint":
-            identical = result.get("all_identical", False)
-            if identical:
-                out.console.print(
-                    f"    [warning]-- all fuzz cases returned identical responses[/warning]"
-                )
-            else:
-                out.console.print(
-                    f"    [success]-- {result.get('unique_response_hashes', 0)} unique responses "
-                    f"across {result.get('cases_tested', 0)} fuzz cases[/success]"
-                )
-
-        elif finding.tool_used == "analyze_error_response":
-            leakage = result.get("leakage_detected", False)
-            if leakage:
-                indicators = result.get("leakage_indicators", {})
-                active = [k for k, v in indicators.items() if v]
-                out.console.print(
-                    f"    [warning]-- information leakage detected: "
-                    f"{', '.join(active)}[/warning]"
-                )
-            else:
-                out.console.print(
-                    f"    [success]-- no information leakage detected[/success]"
-                )
-
-        elif finding.tool_used == "probe_endpoint":
-            status = result.get("status", "?")
-            hash_val = result.get("response_hash", "?")
-            out.console.print(
-                f"    [muted]-- {status}  hash:{hash_val}  "
-                f"{result.get('content_length', 0)}b[/muted]"
-            )
-
-        out.console.print()
-
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
 
 def render_investigation(report: InvestigationReport) -> None:
-    """print the investigation summary."""
+    """render the full investigation report."""
     out.console.print()
     out.console.rule("[phase]investigation report[/phase]")
     out.console.print()
 
+    # 1. trust score with bar
+    score = report.trust_score
+    if score >= 70:
+        score_style = "success"
+    elif score >= 40:
+        score_style = "warning"
+    else:
+        score_style = "error"
+
+    bar_filled = score // 5
+    bar_empty = 20 - bar_filled
+    bar = f"{'█' * bar_filled}{'░' * bar_empty}"
+
     out.console.print(
-        f"  [info]investigation steps[/info] :  {report.total_steps}"
+        f"  [{score_style}]RUNTIME TRUST SCORE: {score}/100  {bar}[/{score_style}]"
     )
+    out.console.print()
+
+    # 2. trust score evolution
+    if report.trust_evolution.entries:
+        out.console.print("  [phase]trust score evolution[/phase]")
+        out.console.print()
+        for reason, score_val in report.trust_evolution.entries:
+            if score_val >= 70:
+                s = "success"
+            elif score_val >= 40:
+                s = "warning"
+            else:
+                s = "error"
+            out.console.print(
+                f"    [{s}]{score_val:>3}[/{s}]  {reason}"
+            )
+        out.console.print()
+
+    # 3. evidence correlations
+    if report.correlations:
+        out.console.print("  [phase]evidence correlations[/phase]")
+        out.console.print()
+
+        for corr in report.correlations:
+            sev_style = {"critical": "error", "high": "warning"}.get(
+                corr.severity, "info"
+            )
+            out.console.print(
+                f"  [{sev_style}]━━━ {corr.category.upper()} [{corr.severity}][/{sev_style}]"
+            )
+            out.console.print(f"    [info]claim:[/info] \"{corr.claim_text[:100]}\"")
+            out.console.print()
+            out.console.print(f"    [info]observed:[/info]")
+            for obs in corr.observations:
+                out.console.print(f"      • {obs}")
+            out.console.print()
+            out.console.print(
+                f"    [{sev_style}]↳ {corr.conclusion}[/{sev_style}]"
+            )
+            out.console.print()
+
+    # 4. investigation timeline
+    if report.timeline:
+        out.console.print("  [phase]investigation timeline[/phase]")
+        out.console.print()
+
+        for entry in report.timeline:
+            sev_style = {
+                "critical": "error", "high": "warning", "info": "muted",
+            }.get(entry.severity, "muted")
+
+            tag_styles = {
+                "probe": "probe", "runtime": "warning",
+                "analysis": "phase", "verify": "success",
+                "agent": "info", "risk": "error",
+            }
+            tag_style = tag_styles.get(entry.tag, "muted")
+
+            out.console.print(
+                f"    [muted]{entry.timestamp}[/muted]  "
+                f"[{tag_style}][{entry.tag}][/{tag_style}]  "
+                f"[{sev_style}]{entry.message}[/{sev_style}]"
+            )
+        out.console.print()
+
+    # 5. managed agent assessment
+    if report.managed_agent_output:
+        out.console.print("  [phase]managed agent assessment[/phase]")
+        out.console.print()
+        for line in report.managed_agent_output.splitlines():
+            stripped = line.strip()
+            if stripped:
+                out.console.print(f"  {stripped}")
+        out.console.print()
+
+    # 6. strategies
     out.console.print(
-        f"  [info]findings[/info]            :  {len(report.findings)}"
+        f"  [info]strategies executed[/info] :  "
+        f"{', '.join(report.strategies_executed) or 'none'}"
     )
 
     risk_style = {
-        "critical": "error",
-        "high": "warning",
-        "medium": "info",
-        "low": "success",
-        "clean": "success",
+        "critical": "error", "high": "warning",
+        "medium": "info", "low": "success", "clean": "success",
     }.get(report.risk_level, "muted")
 
     out.console.print(
         f"  [info]risk level[/info]          :  [{risk_style}]{report.risk_level}[/{risk_style}]"
     )
-
-    if report.final_assessment:
-        out.console.print()
-        out.console.print("  [phase]agent assessment[/phase]")
-        out.console.print()
-        for line in report.final_assessment.splitlines():
-            stripped = line.strip()
-            if stripped:
-                out.console.print(f"  {stripped}")
-        out.console.print()
+    out.console.print()

@@ -76,3 +76,18 @@ def info(msg: str) -> None:
 def muted(msg: str) -> None:
     """print a dim/muted message."""
     console.print(f"  [muted]{msg}[/muted]")
+
+
+def event(tag: str, msg: str) -> None:
+    """print a live event stream message with colored tag."""
+    tag_styles = {
+        "probe": "probe",
+        "runtime": "warning",
+        "analysis": "phase",
+        "verify": "success",
+        "agent": "info",
+        "risk": "error",
+    }
+    style = tag_styles.get(tag, "muted")
+    console.print(f"    [{style}][{tag}][/{style}] {msg}")
+

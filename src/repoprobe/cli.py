@@ -415,14 +415,23 @@ def investigate(
             )
     if contradiction_report.contradictions:
         total = len(contradiction_report.contradictions)
-        out.failure(f"contradictions: {total} detected")
-    if investigation_report:
-        risk_style = {"critical": "error", "high": "warning"}.get(
-            investigation_report.risk_level, "info"
+        critical = len(contradiction_report.critical)
+        high = len(contradiction_report.high)
+        out.failure(
+            f"contradictions: {total} detected "
+            f"({critical} critical, {high} high)"
         )
+    if investigation_report:
+        score = investigation_report.trust_score
+        if score >= 70:
+            score_style = "success"
+        elif score >= 40:
+            score_style = "warning"
+        else:
+            score_style = "error"
         out.console.print(
-            f"  [{risk_style}]investigation risk: "
-            f"{investigation_report.risk_level}[/{risk_style}]"
+            f"  [{score_style}]trust score: "
+            f"{score}/100  risk: {investigation_report.risk_level}[/{score_style}]"
         )
     out.console.print()
 

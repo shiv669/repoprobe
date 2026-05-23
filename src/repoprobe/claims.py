@@ -8,9 +8,9 @@ reads the readme, extracts claims about what the software does,
 then cross-references against runtime evidence to detect
 behavioral contradictions.
 
-no gemini. no embeddings. no vector search.
-pure deterministic keyword extraction + rule-based contradiction logic.
-hard evidence first — gemini interprets later, never generates.
+PRECISION FIRST — only high-confidence claims generate contradictions.
+noisy keyword matches (urls, setup docs, shell commands) are filtered.
+contradictions are deduplicated by evidence type.
 """
 
 import re
@@ -24,54 +24,60 @@ from repoprobe.runner import RunResult, RuntimeStatus
 from repoprobe import console as out
 
 
-# -- claim category keyword maps
+# ---------------------------------------------------------------------------
+# keyword maps — REFINED to avoid false positives
+# ---------------------------------------------------------------------------
 
+# removed: "token" (too generic), "session" (too generic), "cookie"
 _AUTH_KEYWORDS = [
-    "jwt", "authentication", "auth", "oauth", "login", "signup",
-    "sign-in", "sign-up", "session", "authorization", "token",
-    "credentials", "password", "bcrypt", "passport", "cookie",
-    "access control", "role-based", "rbac", "2fa", "mfa",
-    "two-factor", "multi-factor",
+    "jwt authentication", "authentication", "oauth", "login system",
+    "signup", "sign-in", "sign-up", "authorization",
+    "bcrypt", "passport", "access control", "role-based", "rbac",
+    "2fa", "mfa", "two-factor", "multi-factor",
 ]
 
+# removed: "tier", "plan", "premium", "pricing" — these describe cost, not payment functionality
 _PAYMENT_KEYWORDS = [
-    "stripe", "payment", "billing", "subscription", "checkout",
-    "razorpay", "paypal", "invoice", "charge", "pricing",
-    "plan", "tier", "premium",
+    "stripe integration", "payment processing", "billing system",
+    "checkout", "razorpay", "paypal integration",
+    "payment gateway", "secure payments", "payment endpoint",
 ]
 
+# removed: "http", "request", "response", "route", "routes" — way too generic
 _API_KEYWORDS = [
-    "rest api", "restful", "api endpoint", "graphql", "grpc",
-    "route", "routes", "endpoint", "endpoints", "crud",
-    "request", "response", "http",
+    "rest api", "restful api", "api endpoint", "graphql api", "grpc",
+    "crud operations", "api server", "api built with",
 ]
 
+# removed: generic "sql", "orm", "migration"
 _DATABASE_KEYWORDS = [
-    "postgresql", "postgres", "mongodb", "redis", "mysql",
-    "sqlite", "database", "prisma", "sequelize", "typeorm",
-    "mongoose", "knex", "drizzle", "sql", "nosql", "orm",
-    "migration",
+    "postgresql", "postgres", "mongodb", "redis cache",
+    "mysql database", "sqlite", "database integration",
+    "prisma", "sequelize", "typeorm", "mongoose",
 ]
 
+# removed: "deployment", "deployed", "stable" — too generic, match setup docs
 _PRODUCTION_KEYWORDS = [
-    "production ready", "production-ready", "enterprise",
-    "scalable", "production grade", "production-grade",
-    "battle tested", "battle-tested", "high availability",
-    "fault tolerant", "reliable", "robust", "stable",
-    "deployed", "deployment",
+    "production ready", "production-ready",
+    "enterprise grade", "enterprise-grade",
+    "production grade", "production-grade",
+    "battle tested", "battle-tested",
+    "high availability", "fault tolerant",
 ]
 
 _SECURITY_KEYWORDS = [
-    "secure", "security", "encryption", "encrypted", "https",
-    "cors", "rate limit", "rate-limit", "csrf", "xss",
-    "sanitize", "validate", "helmet", "ssl", "tls",
+    "secure authentication", "encryption", "encrypted",
+    "rate limiting", "csrf protection", "xss protection",
+    "input validation", "security hardened",
 ]
 
+# removed: generic "model", "prediction", "training"
 _AI_KEYWORDS = [
-    "ai", "artificial intelligence", "machine learning", "ml",
-    "model", "inference", "gpt", "llm", "openai", "gemini",
-    "neural", "deep learning", "training", "prediction",
-    "nlp", "computer vision", "transformer",
+    "ai-powered", "artificial intelligence", "machine learning pipeline",
+    "ml model", "inference engine", "gpt integration", "llm integration",
+    "openai integration", "gemini integration",
+    "deep learning", "neural network", "nlp pipeline",
+    "computer vision", "transformer model",
 ]
 
 _CATEGORY_MAP = {
@@ -85,7 +91,40 @@ _CATEGORY_MAP = {
 }
 
 
-# -- data structures
+# ---------------------------------------------------------------------------
+# confidence signals
+# ---------------------------------------------------------------------------
+
+# words that BOOST confidence — the line is making a real claim
+_POSITIVE_SIGNALS = [
+    "supports", "implements", "provides", "features",
+    "built with", "built on", "includes", "enables",
+    "offers", "powered by", "uses", "integrates",
+    "handles", "manages", "ensures", "guarantees",
+]
+
+# patterns that REDUCE confidence — the line is noise
+_NOISE_PATTERNS = [
+    r"^https?://",                    # bare urls
+    r"^git\s+clone",                  # git commands
+    r"^npm\s+(install|run|start)",    # npm commands
+    r"^pip\s+install",               # pip commands
+    r"^python\s+",                   # python commands
+    r"^cd\s+",                       # cd commands
+    r"^docker\s+",                   # docker commands
+    r"^curl\s+",                     # curl commands
+    r"^\$\s+",                       # shell prompts
+    r"^```",                         # code fences
+    r"^\d+\.\s+(install|run|clone|create|open|navigate|enter)",  # numbered steps
+    r"^step\s+\d+",                  # step N instructions
+]
+
+_NOISE_COMPILED = [re.compile(p, re.IGNORECASE) for p in _NOISE_PATTERNS]
+
+
+# ---------------------------------------------------------------------------
+# data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Claim:
@@ -93,6 +132,7 @@ class Claim:
     text: str
     category: str
     keyword_matched: str
+    confidence: float = 0.5
     source_line: int = 0
 
 
@@ -101,7 +141,7 @@ class Contradiction:
     """a detected contradiction between claim and runtime evidence."""
     claim: Claim
     evidence: list[str]
-    severity: str  # critical, high, medium, low
+    severity: str  # critical, high, medium
     explanation: str
 
 
@@ -122,20 +162,23 @@ class ContradictionReport:
         return [c for c in self.contradictions if c.severity == "high"]
 
 
-# -- claim extractor
+# ---------------------------------------------------------------------------
+# claim extractor — precision version
+# ---------------------------------------------------------------------------
 
 class ClaimExtractor:
     """
     extracts verifiable claims from a readme file.
-    uses keyword matching on sentences/bullet points.
-    no llm, no embeddings — deterministic only.
+    uses keyword matching with confidence scoring.
+    filters out noise (urls, commands, setup instructions).
     """
 
-    # readme filename patterns
     _README_NAMES = [
         "README.md", "readme.md", "Readme.md",
         "README", "README.rst", "README.txt",
     ]
+
+    CONFIDENCE_THRESHOLD = 0.65
 
     def __init__(self, repo_root: Path) -> None:
         self.root = repo_root
@@ -143,7 +186,7 @@ class ClaimExtractor:
         self.readme_content: str = ""
 
     def extract(self) -> list[Claim]:
-        """find and parse the readme, extract claims."""
+        """find and parse the readme, extract high-confidence claims only."""
         self.readme_path = self._find_readme()
         if not self.readme_path:
             return []
@@ -154,11 +197,25 @@ class ClaimExtractor:
 
         claims: list[Claim] = []
         lines = self.readme_content.splitlines()
+        in_code_block = False
 
         for line_num, line in enumerate(lines, 1):
+            # track code blocks
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                continue
+
             # clean markdown formatting
             clean = self._strip_markdown(line).strip()
-            if not clean or len(clean) < 5:
+
+            # skip short or empty lines
+            if not clean or len(clean) < 15:
+                continue
+
+            # skip noise lines (urls, commands, steps)
+            if self._is_noise(clean):
                 continue
 
             # check each category
@@ -166,12 +223,22 @@ class ClaimExtractor:
             for category, keywords in _CATEGORY_MAP.items():
                 for keyword in keywords:
                     if keyword in lower:
-                        # avoid duplicate claims for the same line
-                        if not any(c.source_line == line_num and c.category == category for c in claims):
+                        confidence = self._compute_confidence(clean, keyword, category)
+
+                        # only keep high-confidence claims
+                        if confidence < self.CONFIDENCE_THRESHOLD:
+                            continue
+
+                        # avoid duplicate claims for the same line + category
+                        if not any(
+                            c.source_line == line_num and c.category == category
+                            for c in claims
+                        ):
                             claims.append(Claim(
                                 text=clean,
                                 category=category,
                                 keyword_matched=keyword,
+                                confidence=confidence,
                                 source_line=line_num,
                             ))
                         break
@@ -187,31 +254,83 @@ class ClaimExtractor:
         return None
 
     @staticmethod
+    def _is_noise(line: str) -> bool:
+        """detect lines that are noise, not claims."""
+        for pattern in _NOISE_COMPILED:
+            if pattern.search(line):
+                return True
+        # bare urls anywhere in the line (as the main content)
+        if re.match(r"^https?://\S+$", line.strip()):
+            return True
+        return False
+
+    @staticmethod
+    def _compute_confidence(line: str, keyword: str, category: str) -> float:
+        """compute confidence that this line is making a real functional claim."""
+        confidence = 0.5
+        lower = line.lower()
+
+        # boost: positive signal words present
+        for signal in _POSITIVE_SIGNALS:
+            if signal in lower:
+                confidence += 0.12
+                break  # only count once
+
+        # boost: keyword is multi-word (more specific)
+        if " " in keyword:
+            confidence += 0.15
+
+        # boost: line looks like a feature statement (not too long)
+        if 20 < len(line) < 150:
+            confidence += 0.08
+
+        # penalize: very long lines (likely paragraphs, not claims)
+        if len(line) > 200:
+            confidence -= 0.15
+
+        # penalize: contains urls
+        if "http://" in lower or "https://" in lower:
+            confidence -= 0.25
+
+        # penalize: looks like setup/installation context
+        setup_words = ["install", "clone", "download", "setup", "configure", "run"]
+        setup_count = sum(1 for w in setup_words if w in lower)
+        if setup_count >= 2:
+            confidence -= 0.20
+
+        # penalize: looks like troubleshooting
+        trouble_words = ["error", "solution", "fix", "issue", "problem", "troubleshoot"]
+        if any(w in lower for w in trouble_words):
+            confidence -= 0.15
+
+        # penalize: looks like a limitation note
+        if any(w in lower for w in ["limitation", "constraint", "caveat", "not yet"]):
+            confidence -= 0.20
+
+        return max(0.0, min(1.0, confidence))
+
+    @staticmethod
     def _strip_markdown(line: str) -> str:
         """strip common markdown formatting from a line."""
-        # remove headers
         line = re.sub(r"^#{1,6}\s+", "", line)
-        # remove bold/italic
         line = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", line)
         line = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", line)
-        # remove inline code
         line = re.sub(r"`([^`]+)`", r"\1", line)
-        # remove links
         line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
-        # remove list markers
         line = re.sub(r"^[\s]*[-*+]\s+", "", line)
-        # remove numbered lists
         line = re.sub(r"^[\s]*\d+\.\s+", "", line)
         return line
 
 
-# -- contradiction engine
+# ---------------------------------------------------------------------------
+# contradiction engine — precision version
+# ---------------------------------------------------------------------------
 
 class ContradictionEngine:
     """
     compares extracted claims against runtime evidence.
-    uses deterministic rule-based logic to detect contradictions.
-    no llm — just hard boolean rules against hard runtime data.
+    deduplicates contradictions by evidence type.
+    only fires on genuine behavioral mismatches.
     """
 
     def __init__(
@@ -229,18 +348,34 @@ class ContradictionEngine:
         self.run_result = run_result
 
     def analyze(self) -> list[Contradiction]:
-        """run all contradiction rules against all claims."""
-        contradictions: list[Contradiction] = []
+        """run contradiction rules, then deduplicate."""
+        raw: list[Contradiction] = []
 
         for claim in self.claims:
             result = self._check_claim(claim)
             if result:
-                contradictions.append(result)
+                raw.append(result)
 
-        return contradictions
+        # deduplicate: keep highest confidence claim per (category, evidence_key)
+        return self._deduplicate(raw)
+
+    def _deduplicate(self, contradictions: list[Contradiction]) -> list[Contradiction]:
+        """keep only the best contradiction per (category, evidence_signature)."""
+        seen: dict[str, Contradiction] = {}
+
+        for c in contradictions:
+            # create a key from category + first evidence line
+            evidence_key = c.evidence[0] if c.evidence else ""
+            key = f"{c.claim.category}::{evidence_key}"
+
+            existing = seen.get(key)
+            if not existing or c.claim.confidence > existing.claim.confidence:
+                seen[key] = c
+
+        return list(seen.values())
 
     def _check_claim(self, claim: Claim) -> Contradiction | None:
-        """dispatch to the appropriate rule checker based on category."""
+        """dispatch to the appropriate rule checker."""
         checkers = {
             "auth": self._check_auth,
             "payment": self._check_payment,
@@ -250,21 +385,16 @@ class ContradictionEngine:
             "security": self._check_security,
             "ai": self._check_ai,
         }
-
         checker = checkers.get(claim.category)
-        if checker:
-            return checker(claim)
-        return None
+        return checker(claim) if checker else None
 
     # -- rule: auth claims
 
     def _check_auth(self, claim: Claim) -> Contradiction | None:
-        """check auth claims against runtime evidence."""
         evidence = []
 
-        # check if auth endpoints show invariant behavior
         invariant_auth = self._get_invariant_endpoints(
-            ["auth", "login", "signin", "signup", "register", "token", "session"]
+            ["auth", "login", "signin", "signup", "register"]
         )
         if invariant_auth:
             for ep in invariant_auth:
@@ -273,24 +403,14 @@ class ContradictionEngine:
                     f"across {len(ep.runs)} randomized credential probes"
                 )
 
-        # check if auth-like routes return 500
         error_auth = self._get_error_routes(
-            ["auth", "login", "signin", "signup", "register", "token", "session"]
+            ["auth", "login", "signin", "signup", "register"]
         )
         if error_auth:
             for s in error_auth:
                 evidence.append(
                     f"endpoint {s.method} {s.route} returns {s.status} server error"
                 )
-
-        # check if no auth endpoints exist at all
-        auth_surfaces = self._get_surfaces_matching(
-            ["auth", "login", "signin", "signup", "register", "token"]
-        )
-        if not auth_surfaces and not invariant_auth:
-            evidence.append(
-                "no authentication endpoints were discovered at runtime"
-            )
 
         if evidence:
             return Contradiction(
@@ -307,11 +427,10 @@ class ContradictionEngine:
     # -- rule: payment claims
 
     def _check_payment(self, claim: Claim) -> Contradiction | None:
-        """check payment claims against runtime evidence."""
         evidence = []
 
         invariant = self._get_invariant_endpoints(
-            ["payment", "checkout", "charge", "pay", "billing", "subscribe"]
+            ["payment", "checkout", "charge", "pay", "billing"]
         )
         if invariant:
             for ep in invariant:
@@ -329,14 +448,6 @@ class ContradictionEngine:
                     f"endpoint {s.method} {s.route} returns {s.status} server error"
                 )
 
-        surfaces = self._get_surfaces_matching(
-            ["payment", "checkout", "charge", "pay", "billing"]
-        )
-        if not surfaces and not invariant:
-            evidence.append(
-                "no payment endpoints were discovered at runtime"
-            )
-
         if evidence:
             return Contradiction(
                 claim=claim,
@@ -352,7 +463,6 @@ class ContradictionEngine:
     # -- rule: api claims
 
     def _check_api(self, claim: Claim) -> Contradiction | None:
-        """check api claims against runtime evidence."""
         evidence = []
 
         if self.probe:
@@ -360,9 +470,7 @@ class ContradictionEngine:
                 evidence.append(
                     "no reachable api surfaces were discovered at runtime"
                 )
-
-            # all routes returning same error
-            if self.probe.reachable_count > 0:
+            elif self.probe.reachable_count > 0:
                 error_count = len(self.probe.server_errors)
                 total = self.probe.reachable_count
                 if error_count == total:
@@ -385,31 +493,8 @@ class ContradictionEngine:
     # -- rule: database claims
 
     def _check_database(self, claim: Claim) -> Contradiction | None:
-        """check database claims against runtime evidence."""
         evidence = []
 
-        if self.fingerprint:
-            # check if claimed database service is in detected services
-            lower_claim = claim.keyword_matched.lower()
-            detected_lower = [s.name.lower() for s in self.fingerprint.services]
-
-            # map keywords to service names
-            db_service_map = {
-                "postgresql": "postgresql", "postgres": "postgresql",
-                "mongodb": "mongodb", "mongoose": "mongodb",
-                "redis": "redis",
-                "mysql": "mysql",
-                "sqlite": "sqlite",
-            }
-
-            claimed_service = db_service_map.get(lower_claim)
-            if claimed_service and claimed_service not in detected_lower:
-                if not detected_lower:
-                    evidence.append(
-                        "no database services were detected in the codebase"
-                    )
-
-        # check if boot crashed (possibly due to missing db connection)
         if self.run_result and self.run_result.status == RuntimeStatus.CRASHED:
             evidence.append(
                 "application crashed at startup — possibly missing "
@@ -431,28 +516,21 @@ class ContradictionEngine:
     # -- rule: production claims
 
     def _check_production(self, claim: Claim) -> Contradiction | None:
-        """check production readiness claims against runtime evidence."""
         evidence = []
 
-        # crashed on boot
         if self.run_result and self.run_result.status == RuntimeStatus.CRASHED:
-            evidence.append(
-                "application crashed on startup"
-            )
+            evidence.append("application crashed on startup")
 
-        # high error rate
         if self.probe and self.probe.reachable_count > 0:
             error_count = len(self.probe.server_errors)
             total = self.probe.reachable_count
             error_rate = error_count / total if total else 0
-
             if error_rate >= 0.5:
                 evidence.append(
                     f"{error_count}/{total} endpoints return server errors "
                     f"({error_rate:.0%} error rate)"
                 )
 
-        # invariant behavior detected
         if self.verification and self.verification.suspicious_count > 0:
             evidence.append(
                 f"{self.verification.suspicious_count} endpoints show "
@@ -474,7 +552,6 @@ class ContradictionEngine:
     # -- rule: security claims
 
     def _check_security(self, claim: Claim) -> Contradiction | None:
-        """check security claims against runtime evidence."""
         evidence = []
 
         invariant_auth = self._get_invariant_endpoints(
@@ -500,11 +577,10 @@ class ContradictionEngine:
     # -- rule: ai claims
 
     def _check_ai(self, claim: Claim) -> Contradiction | None:
-        """check ai/ml claims against runtime evidence."""
         evidence = []
 
         invariant_ai = self._get_invariant_endpoints(
-            ["ai", "generate", "predict", "infer", "chat", "completion", "model"]
+            ["ai", "generate", "predict", "infer", "chat", "completion"]
         )
         if invariant_ai:
             for ep in invariant_ai:
@@ -528,7 +604,6 @@ class ContradictionEngine:
     # -- helpers
 
     def _get_invariant_endpoints(self, keywords: list[str]) -> list[EndpointVerdict]:
-        """find invariant verdicts matching any of the keywords."""
         if not self.verification:
             return []
         results = []
@@ -541,7 +616,6 @@ class ContradictionEngine:
         return results
 
     def _get_error_routes(self, keywords: list[str]) -> list[RuntimeSurface]:
-        """find surfaces with server errors matching keywords."""
         if not self.probe:
             return []
         results = []
@@ -554,7 +628,6 @@ class ContradictionEngine:
         return results
 
     def _get_surfaces_matching(self, keywords: list[str]) -> list[RuntimeSurface]:
-        """find any surfaces matching keywords."""
         if not self.probe:
             return []
         results = []
@@ -565,7 +638,9 @@ class ContradictionEngine:
         return results
 
 
-# -- rendering
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
 
 def render_contradictions(report: ContradictionReport) -> None:
     """print the claim contradiction analysis."""
@@ -585,7 +660,6 @@ def render_contradictions(report: ContradictionReport) -> None:
     )
 
     if report.claims:
-        # group claims by category
         categories = {}
         for c in report.claims:
             categories.setdefault(c.category, []).append(c)
@@ -593,8 +667,10 @@ def render_contradictions(report: ContradictionReport) -> None:
         out.console.print()
         out.console.print("  [info]claim categories[/info]")
         for cat, items in sorted(categories.items()):
+            avg_conf = sum(c.confidence for c in items) / len(items)
             out.console.print(
-                f"    {cat:<16} {len(items)} claims"
+                f"    {cat:<16} {len(items):>2} claims  "
+                f"(avg confidence: {avg_conf:.0%})"
             )
 
     out.console.print()
@@ -609,34 +685,29 @@ def render_contradictions(report: ContradictionReport) -> None:
     )
     out.console.print()
 
-    # render each contradiction
     for i, contradiction in enumerate(report.contradictions, 1):
         severity_style = {
             "critical": "error",
             "high": "warning",
             "medium": "info",
-            "low": "muted",
         }.get(contradiction.severity, "muted")
 
         out.console.print(
-            f"  [{severity_style}]--- contradiction #{i} "
-            f"[{contradiction.severity}][/{severity_style}]"
+            f"  [{severity_style}]━━━ contradiction #{i} "
+            f"[{contradiction.severity}] "
+            f"(confidence: {contradiction.claim.confidence:.0%})"
+            f"[/{severity_style}]"
         )
         out.console.print()
         out.console.print(
             f"    [info]claim:[/info] \"{contradiction.claim.text}\""
         )
-        out.console.print(
-            f"    [muted]category: {contradiction.claim.category} | "
-            f"keyword: {contradiction.claim.keyword_matched} | "
-            f"line: {contradiction.claim.source_line}[/muted]"
-        )
         out.console.print()
         out.console.print(f"    [info]runtime evidence:[/info]")
         for ev in contradiction.evidence:
-            out.console.print(f"      - {ev}")
+            out.console.print(f"      • {ev}")
         out.console.print()
         out.console.print(
-            f"    [{severity_style}]{contradiction.explanation}[/{severity_style}]"
+            f"    [{severity_style}]↳ {contradiction.explanation}[/{severity_style}]"
         )
         out.console.print()
