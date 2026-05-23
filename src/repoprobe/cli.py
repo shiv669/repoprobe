@@ -159,6 +159,32 @@ def run(
     except Exception as e:
         out.warning(f"claim analysis failed: {e}")
 
+    # phase 7: ai analysis (only if gemini api key is configured)
+    ai_analysis = None
+    if Config.is_ready():
+        try:
+            from repoprobe.analyzer import AIAnalyzer, render_ai_analysis
+
+            out.phase_header(7, "ai analysis")
+            out.info("synthesizing evidence with gemini 3.5 flash...")
+            out.console.print()
+
+            analyzer = AIAnalyzer()
+            ai_analysis = analyzer.analyze(
+                fingerprint=fp,
+                run_result=result,
+                probe_result=probe_result,
+                verification_result=verification_result,
+                contradiction_report=contradiction_report,
+            )
+            render_ai_analysis(ai_analysis)
+
+        except Exception as e:
+            out.warning(f"ai analysis failed: {e}")
+    else:
+        out.console.print()
+        out.muted("  ai analysis skipped — GOOGLE_API_KEY not configured")
+
     # final summary
     out.console.print()
     out.console.rule("[phase]result[/phase]")
@@ -195,6 +221,8 @@ def run(
                 f"claims: {len(contradiction_report.claims)} extracted, "
                 f"0 contradictions"
             )
+        if ai_analysis:
+            out.success("ai analysis: complete")
     elif result.status in (RuntimeStatus.CRASHED, RuntimeStatus.BOOT_FAILED, RuntimeStatus.INSTALL_FAILED):
         out.failure(f"status: {result.status.value}")
         if result.error:

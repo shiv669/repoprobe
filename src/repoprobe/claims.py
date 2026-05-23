@@ -391,7 +391,7 @@ class ContradictionEngine:
         if self.fingerprint:
             # check if claimed database service is in detected services
             lower_claim = claim.keyword_matched.lower()
-            detected_lower = [s.lower() for s in self.fingerprint.services]
+            detected_lower = [s.name.lower() for s in self.fingerprint.services]
 
             # map keywords to service names
             db_service_map = {
