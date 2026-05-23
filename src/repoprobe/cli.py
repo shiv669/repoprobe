@@ -77,6 +77,7 @@ def run(
     from repoprobe.fingerprint import Fingerprinter
     from repoprobe.planner import RuntimePlanner, render_plan
     from repoprobe.runner import ExecutionRunner, RuntimeStatus
+    from repoprobe.probe import RuntimeProbe, render_probe_result
 
     out.phase_header(1, "fingerprint")
     fingerprinter = Fingerprinter(repo_path)
@@ -92,14 +93,30 @@ def run(
         out.failure("cannot execute — no start command determined")
         raise typer.Exit(code=1)
 
-    # phase 3: execute
+    # phase 3: execute (keep app alive for probing)
     out.phase_header(3, "runtime execution")
     runner = ExecutionRunner(
         plan=execution_plan,
         repo_root=repo_path,
         boot_timeout=timeout,
+        keep_alive=True,
     )
     result = runner.execute()
+
+    # phase 4: probe (only if booted)
+    probe_result = None
+    if result.status == RuntimeStatus.BOOTED:
+        out.phase_header(4, "surface discovery")
+        try:
+            prober = RuntimeProbe(execution_plan)
+            probe_result = prober.probe()
+            render_probe_result(probe_result)
+        except Exception as e:
+            out.warning(f"surface probing failed: {e}")
+        finally:
+            runner.shutdown()
+    else:
+        runner.shutdown()
 
     # final summary
     out.console.print()
@@ -108,6 +125,11 @@ def run(
 
     if result.status == RuntimeStatus.BOOTED:
         out.success(f"status: {result.status.value}")
+        if probe_result:
+            out.success(
+                f"surfaces: {probe_result.reachable_count} reachable "
+                f"/ {probe_result.total_probed} probed"
+            )
     elif result.status in (RuntimeStatus.CRASHED, RuntimeStatus.BOOT_FAILED, RuntimeStatus.INSTALL_FAILED):
         out.failure(f"status: {result.status.value}")
         if result.error:
@@ -118,6 +140,7 @@ def run(
             out.muted(f"  {result.error}")
 
     out.console.print()
+
 
 
 @app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})

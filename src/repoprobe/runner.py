@@ -104,6 +104,7 @@ class ExecutionRunner:
         repo_root: Path,
         install_timeout: int = INSTALL_TIMEOUT,
         boot_timeout: int = BOOT_TIMEOUT,
+        keep_alive: bool = False,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> None:
@@ -111,10 +112,12 @@ class ExecutionRunner:
         self.root = repo_root.resolve()
         self.install_timeout = install_timeout
         self.boot_timeout = boot_timeout
+        self.keep_alive = keep_alive
         self.on_stdout = on_stdout or self._default_stdout
         self.on_stderr = on_stderr or self._default_stderr
         self.result = RunResult()
         self._app_process: asyncio.subprocess.Process | None = None
+        self._app_pid: int | None = None
         self._runtime_port: int | None = None
         self._stopped = False
 
@@ -132,16 +135,19 @@ class ExecutionRunner:
             out.warning("interrupted by user")
             self.result.status = RuntimeStatus.STOPPED
         finally:
-            # close subprocess transports while loop is still open
+            # always close transports while loop is still open
             # (prevents windows ProactorEventLoop __del__ warnings)
             if self._app_process:
-                if self._app_process.returncode is None:
-                    try:
-                        self._app_process.kill()
-                        loop.run_until_complete(self._app_process.wait())
-                    except Exception:
-                        pass
-                # close the underlying transport to prevent __del__ noise
+                if not self.keep_alive or self.result.status != RuntimeStatus.BOOTED:
+                    # not keeping alive — kill the process
+                    if self._app_process.returncode is None:
+                        try:
+                            self._app_process.kill()
+                            loop.run_until_complete(self._app_process.wait())
+                        except Exception:
+                            pass
+                # always close transport regardless of keep_alive
+                # (process keeps running as an OS process, transport is just stdio)
                 transport = getattr(self._app_process, "_transport", None)
                 if transport and not transport.is_closing():
                     transport.close()
@@ -239,6 +245,7 @@ class ExecutionRunner:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.root),
             )
+            self._app_pid = self._app_process.pid
 
             # race: stdout streaming + boot detection vs timeout
             try:
@@ -263,7 +270,8 @@ class ExecutionRunner:
             self.result.status = RuntimeStatus.BOOT_FAILED
             self.result.error = str(e)
         finally:
-            await self._cleanup_app()
+            if not self.keep_alive or self.result.status != RuntimeStatus.BOOTED:
+                await self._cleanup_app()
 
     async def _monitor_boot(self) -> None:
         """read stdout/stderr lines and watch for boot signals."""
@@ -347,10 +355,13 @@ class ExecutionRunner:
                 out.info(f"detected actual port: {actual_port}")
                 self.plan.expected_port = actual_port
 
-            # give port a moment to open if keyword detected first
+            # give port time to fully open if keyword detected first
             if not self.result.port_reachable and self.plan.expected_port:
-                await asyncio.sleep(1)
-                self.result.port_reachable = self._check_port(self.plan.expected_port)
+                for _ in range(4):
+                    await asyncio.sleep(0.5)
+                    if self._check_port(self.plan.expected_port):
+                        self.result.port_reachable = True
+                        break
 
             self._print_boot_success()
 
@@ -404,12 +415,33 @@ class ExecutionRunner:
         except Exception:
             pass
 
+    def shutdown(self) -> None:
+        """synchronous kill of the app process. call after probing is done."""
+        import os
+        import signal as sig
+
+        pid = self._app_pid
+        if not pid:
+            return
+
+        try:
+            if sys.platform == "win32":
+                os.kill(pid, sig.SIGTERM)
+            else:
+                os.kill(pid, sig.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+        out.muted("  application process terminated")
+
     def _force_cleanup(self) -> None:
         """last-resort synchronous cleanup for ctrl+c / exceptions."""
-        if self._app_process and self._app_process.returncode is None:
+        if self._app_pid:
+            import os
+            import signal as sig
             try:
-                self._app_process.kill()
-            except Exception:
+                os.kill(self._app_pid, sig.SIGTERM)
+            except (ProcessLookupError, OSError):
                 pass
 
     # -- default output handlers -------------------------------------------
