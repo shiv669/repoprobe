@@ -14,9 +14,9 @@ from repoprobe import __version__
 from repoprobe.config import Config
 from repoprobe import console as out
 
-# ---------------------------------------------------------------------------
+
 # typer app
-# ---------------------------------------------------------------------------
+
 
 app = typer.Typer(
     name="repoprobe",
@@ -27,9 +27,9 @@ app = typer.Typer(
 )
 
 
-# ---------------------------------------------------------------------------
+
 # commands
-# ---------------------------------------------------------------------------
+
 
 
 @app.command()
@@ -79,6 +79,41 @@ def run(
     # (we'll wire this up in the next step)
     out.info("verification pipeline will be connected here")
     out.muted("setup complete — ready for phase integration")
+
+
+@app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
+def inspect(
+    ctx: typer.Context,
+    repo: list[str] = typer.Argument(
+        ...,
+        help="path to the target repository to inspect.",
+    ),
+) -> None:
+    """
+    traverse a repository and produce a runtime fingerprint.
+
+    scans the codebase to detect repo type, package manager,
+    entry point, environment files, route surfaces, and
+    external service dependencies. does not execute anything —
+    this is a read-only static traversal.
+    """
+    out.banner()
+
+    full_path = " ".join(repo + ctx.args)
+    repo_path = Path(full_path).resolve()
+    if not repo_path.exists():
+        out.failure(f"path does not exist: {repo_path}")
+        raise typer.Exit(code=1)
+
+    if not repo_path.is_dir():
+        out.failure(f"path is not a directory: {repo_path}")
+        raise typer.Exit(code=1)
+
+    from repoprobe.fingerprint import Fingerprinter, render_fingerprint
+
+    fingerprinter = Fingerprinter(repo_path)
+    fp = fingerprinter.run()
+    render_fingerprint(fp)
 
 
 @app.command()
@@ -166,9 +201,7 @@ def version() -> None:
     out.console.print(f"repoprobe v{__version__}")
 
 
-# ---------------------------------------------------------------------------
 # entry point (for `python -m repoprobe`)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app()
