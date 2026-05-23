@@ -78,6 +78,7 @@ def run(
     from repoprobe.planner import RuntimePlanner, render_plan
     from repoprobe.runner import ExecutionRunner, RuntimeStatus
     from repoprobe.probe import RuntimeProbe, render_probe_result
+    from repoprobe.verifier import BehavioralVerifier, render_verification
 
     out.phase_header(1, "fingerprint")
     fingerprinter = Fingerprinter(repo_path)
@@ -93,7 +94,7 @@ def run(
         out.failure("cannot execute — no start command determined")
         raise typer.Exit(code=1)
 
-    # phase 3: execute (keep app alive for probing)
+    # phase 3: execute (keep app alive for probing + verification)
     out.phase_header(3, "runtime execution")
     runner = ExecutionRunner(
         plan=execution_plan,
@@ -103,16 +104,26 @@ def run(
     )
     result = runner.execute()
 
-    # phase 4: probe (only if booted)
+    # phase 4 + 5: probe and verify (only if booted)
     probe_result = None
+    verification_result = None
     if result.status == RuntimeStatus.BOOTED:
-        out.phase_header(4, "surface discovery")
         try:
+            # phase 4: surface discovery
+            out.phase_header(4, "surface discovery")
             prober = RuntimeProbe(execution_plan)
             probe_result = prober.probe()
             render_probe_result(probe_result)
+
+            # phase 5: behavioral verification (only if reachable surfaces exist)
+            if probe_result and probe_result.reachable_count > 0:
+                out.phase_header(5, "behavioral verification")
+                verifier = BehavioralVerifier(prober.base_url, probe_result)
+                verification_result = verifier.verify()
+                render_verification(verification_result)
+
         except Exception as e:
-            out.warning(f"surface probing failed: {e}")
+            out.warning(f"probing/verification failed: {e}")
         finally:
             runner.shutdown()
     else:
@@ -130,6 +141,17 @@ def run(
                 f"surfaces: {probe_result.reachable_count} reachable "
                 f"/ {probe_result.total_probed} probed"
             )
+        if verification_result:
+            if verification_result.suspicious_count > 0:
+                out.warning(
+                    f"verification: {verification_result.suspicious_count} suspicious "
+                    f"/ {verification_result.total_verified} verified"
+                )
+            else:
+                out.success(
+                    f"verification: {verification_result.clean_count} clean "
+                    f"/ {verification_result.total_verified} verified"
+                )
     elif result.status in (RuntimeStatus.CRASHED, RuntimeStatus.BOOT_FAILED, RuntimeStatus.INSTALL_FAILED):
         out.failure(f"status: {result.status.value}")
         if result.error:

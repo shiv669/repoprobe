@@ -59,6 +59,9 @@ _PORT_FROM_OUTPUT = re.compile(
     re.IGNORECASE,
 )
 
+# strip ANSI escape codes from output for clean matching
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
 # default timeouts
 INSTALL_TIMEOUT = 120   # seconds
 BOOT_TIMEOUT = 30       # seconds
@@ -294,21 +297,24 @@ class ExecutionRunner:
                     self.result.stdout_lines.append(line)
                     self.on_stdout(line)
 
+                # strip ansi codes for clean matching
+                clean = _ANSI_ESCAPE.sub("", line)
+
                 # try to extract actual port from output
-                port_match = _PORT_FROM_OUTPUT.search(line)
+                port_match = _PORT_FROM_OUTPUT.search(clean)
                 if port_match:
                     detected = port_match.group(1) or port_match.group(2)
                     if detected:
                         self._runtime_port = int(detected)
 
-                # check for boot keywords
+                # check for boot keywords (don't return — keep reading for port info)
                 if not boot_event.is_set():
-                    lower = line.lower()
+                    lower = clean.lower()
                     for keyword in _BOOT_KEYWORDS:
                         if keyword in lower:
-                            self.result.boot_line = line
+                            self.result.boot_line = clean.strip()
                             boot_event.set()
-                            return
+                            break
 
         async def poll_port() -> None:
             """poll the expected port until it opens."""
@@ -343,6 +349,9 @@ class ExecutionRunner:
 
         # wait until boot is detected or all streams end
         await boot_event.wait()
+
+        # give a moment for port lines to arrive after boot keyword
+        await asyncio.sleep(1.0)
 
         # if boot was detected (not crash), mark success
         if self.result.status != RuntimeStatus.CRASHED:
