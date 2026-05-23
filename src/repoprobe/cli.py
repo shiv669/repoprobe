@@ -238,6 +238,193 @@ def run(
     out.console.print()
 
 
+@app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
+def investigate(
+    ctx: typer.Context,
+    repo: list[str] = typer.Argument(
+        ...,
+        help="path to the target repository to investigate.",
+    ),
+    timeout: int = typer.Option(
+        30,
+        "--timeout",
+        "-t",
+        help="boot detection timeout in seconds.",
+    ),
+) -> None:
+    """
+    run a full verification + autonomous investigation.
+
+    executes all phases of `run`, then launches a managed
+    investigation agent that autonomously probes suspicious
+    behavior using gemini function calling.
+    """
+    out.banner()
+
+    full_path = " ".join(repo + ctx.args)
+    repo_path = Path(full_path).resolve()
+
+    if not repo_path.exists():
+        out.failure(f"path does not exist: {repo_path}")
+        raise typer.Exit(code=1)
+
+    out.info(f"target: {repo_path}")
+
+    # phases 1-7: same as run
+    from repoprobe.fingerprint import Fingerprinter
+    from repoprobe.planner import RuntimePlanner, render_plan
+    from repoprobe.runner import ExecutionRunner, RuntimeStatus
+    from repoprobe.probe import RuntimeProbe, render_probe_result
+    from repoprobe.verifier import BehavioralVerifier, render_verification
+    from repoprobe.claims import (
+        ClaimExtractor, ContradictionEngine,
+        ContradictionReport, render_contradictions,
+    )
+
+    # phase 1: fingerprint
+    out.phase_header(1, "fingerprint")
+    fingerprinter = Fingerprinter(repo_path)
+    fp = fingerprinter.run()
+
+    # phase 2: plan
+    out.phase_header(2, "execution plan")
+    planner = RuntimePlanner(fp, repo_path)
+    execution_plan = planner.synthesize()
+    render_plan(execution_plan)
+
+    if execution_plan.start_command == "unknown":
+        out.failure("cannot execute — no start command determined")
+        raise typer.Exit(code=1)
+
+    # phase 3: execute (keep alive for investigation)
+    out.phase_header(3, "runtime execution")
+    runner = ExecutionRunner(
+        plan=execution_plan,
+        repo_root=repo_path,
+        boot_timeout=timeout,
+        keep_alive=True,
+    )
+    result = runner.execute()
+
+    # phase 4-6: probe, verify, contradict
+    probe_result = None
+    verification_result = None
+    contradiction_report = ContradictionReport()
+    prober_base_url = None
+
+    if result.status != RuntimeStatus.BOOTED:
+        runner.shutdown()
+        out.failure(f"cannot investigate — app did not boot ({result.status.value})")
+        if result.error:
+            out.muted(f"  {result.error}")
+        raise typer.Exit(code=1)
+
+    try:
+        # phase 4: surface discovery
+        out.phase_header(4, "surface discovery")
+        prober = RuntimeProbe(execution_plan)
+        probe_result = prober.probe()
+        prober_base_url = prober.base_url
+        render_probe_result(probe_result)
+
+        # phase 5: behavioral verification
+        if probe_result and probe_result.reachable_count > 0:
+            out.phase_header(5, "behavioral verification")
+            verifier = BehavioralVerifier(prober.base_url, probe_result)
+            verification_result = verifier.verify()
+            render_verification(verification_result)
+
+        # phase 6: claim contradiction
+        out.phase_header(6, "claim contradiction analysis")
+        extractor = ClaimExtractor(repo_path)
+        claims = extractor.extract()
+        contradiction_report.readme_found = extractor.readme_path is not None
+        contradiction_report.readme_path = str(extractor.readme_path or "")
+        contradiction_report.claims = claims
+        if claims:
+            engine = ContradictionEngine(
+                claims=claims,
+                probe_result=probe_result,
+                verification_result=verification_result,
+                fingerprint=fp,
+                run_result=result,
+            )
+            contradiction_report.contradictions = engine.analyze()
+        render_contradictions(contradiction_report)
+
+        # phase 7: ai analysis
+        ai_analysis = None
+        if Config.is_ready():
+            from repoprobe.analyzer import AIAnalyzer, render_ai_analysis
+
+            out.phase_header(7, "ai analysis")
+            out.info("synthesizing evidence with gemini 3.5 flash...")
+            out.console.print()
+            analyzer = AIAnalyzer()
+            ai_analysis = analyzer.analyze(
+                fingerprint=fp,
+                run_result=result,
+                probe_result=probe_result,
+                verification_result=verification_result,
+                contradiction_report=contradiction_report,
+            )
+            render_ai_analysis(ai_analysis)
+
+        # phase 8: autonomous investigation (the agent layer)
+        investigation_report = None
+        if Config.is_ready() and prober_base_url:
+            from repoprobe.investigator import (
+                InvestigationAgent, render_investigation,
+            )
+
+            out.phase_header(8, "autonomous investigation")
+            out.info("launching managed investigation agent...")
+            out.console.print()
+
+            agent = InvestigationAgent(base_url=prober_base_url)
+            investigation_report = agent.investigate(
+                fingerprint=fp,
+                run_result=result,
+                probe_result=probe_result,
+                verification_result=verification_result,
+                contradiction_report=contradiction_report,
+            )
+            render_investigation(investigation_report)
+
+    except Exception as e:
+        out.warning(f"investigation failed: {e}")
+    finally:
+        runner.shutdown()
+
+    # final summary
+    out.console.print()
+    out.console.rule("[phase]investigation result[/phase]")
+    out.console.print()
+
+    out.success(f"status: {result.status.value}")
+    if probe_result:
+        out.success(
+            f"surfaces: {probe_result.reachable_count} reachable "
+            f"/ {probe_result.total_probed} probed"
+        )
+    if verification_result:
+        if verification_result.suspicious_count > 0:
+            out.warning(
+                f"verification: {verification_result.suspicious_count} suspicious "
+                f"/ {verification_result.total_verified} verified"
+            )
+    if contradiction_report.contradictions:
+        total = len(contradiction_report.contradictions)
+        out.failure(f"contradictions: {total} detected")
+    if investigation_report:
+        risk_style = {"critical": "error", "high": "warning"}.get(
+            investigation_report.risk_level, "info"
+        )
+        out.console.print(
+            f"  [{risk_style}]investigation risk: "
+            f"{investigation_report.risk_level}[/{risk_style}]"
+        )
+    out.console.print()
 
 
 @app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
