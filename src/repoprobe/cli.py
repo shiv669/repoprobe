@@ -32,53 +32,92 @@ app = typer.Typer(
 
 
 
-@app.command()
+@app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
 def run(
-    repo: str = typer.Argument(
+    ctx: typer.Context,
+    repo: list[str] = typer.Argument(
         ...,
         help="path to the target repository to verify.",
+    ),
+    timeout: int = typer.Option(
+        30,
+        "--timeout",
+        "-t",
+        help="boot detection timeout in seconds.",
     ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
         "-v",
-        help="show detailed agent reasoning and shell output.",
+        help="show detailed install output.",
     ),
 ) -> None:
     """
     execute a full verification run against a target repository.
 
-    repoprobe will boot the application inside an isolated sandbox,
-    discover its runtime surfaces, probe behavior, and produce
-    a verification report with a readme trust score.
+    fingerprints the repo, synthesizes an execution plan,
+    installs dependencies, boots the application, and detects
+    successful startup.
     """
     out.banner()
 
-    # validate repo path
-    repo_path = Path(repo).resolve()
+    full_path = " ".join(repo + ctx.args)
+    repo_path = Path(full_path).resolve()
     if not repo_path.exists():
-        out.failure(f"repository path does not exist: {repo_path}")
+        out.failure(f"path does not exist: {repo_path}")
         raise typer.Exit(code=1)
 
     if not repo_path.is_dir():
         out.failure(f"path is not a directory: {repo_path}")
         raise typer.Exit(code=1)
 
-    out.info(f"target repository: {repo_path}")
+    out.info(f"target: {repo_path}")
 
-    # validate config
-    config_errors = Config.validate()
-    if config_errors:
-        for err in config_errors:
-            out.failure(err)
+    # phase 1: fingerprint
+    from repoprobe.fingerprint import Fingerprinter
+    from repoprobe.planner import RuntimePlanner, render_plan
+    from repoprobe.runner import ExecutionRunner, RuntimeStatus
+
+    out.phase_header(1, "fingerprint")
+    fingerprinter = Fingerprinter(repo_path)
+    fp = fingerprinter.run()
+
+    # phase 2: plan
+    out.phase_header(2, "execution plan")
+    planner = RuntimePlanner(fp, repo_path)
+    execution_plan = planner.synthesize()
+    render_plan(execution_plan)
+
+    if execution_plan.start_command == "unknown":
+        out.failure("cannot execute — no start command determined")
         raise typer.Exit(code=1)
 
-    out.success("configuration validated")
+    # phase 3: execute
+    out.phase_header(3, "runtime execution")
+    runner = ExecutionRunner(
+        plan=execution_plan,
+        repo_root=repo_path,
+        boot_timeout=timeout,
+    )
+    result = runner.execute()
 
-    # placeholder for the orchestration pipeline
-    # (we'll wire this up in the next step)
-    out.info("verification pipeline will be connected here")
-    out.muted("setup complete — ready for phase integration")
+    # final summary
+    out.console.print()
+    out.console.rule("[phase]result[/phase]")
+    out.console.print()
+
+    if result.status == RuntimeStatus.BOOTED:
+        out.success(f"status: {result.status.value}")
+    elif result.status in (RuntimeStatus.CRASHED, RuntimeStatus.BOOT_FAILED, RuntimeStatus.INSTALL_FAILED):
+        out.failure(f"status: {result.status.value}")
+        if result.error:
+            out.muted(f"  {result.error}")
+    else:
+        out.warning(f"status: {result.status.value}")
+        if result.error:
+            out.muted(f"  {result.error}")
+
+    out.console.print()
 
 
 @app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
