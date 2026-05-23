@@ -116,6 +116,47 @@ def inspect(
     render_fingerprint(fp)
 
 
+@app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
+def plan(
+    ctx: typer.Context,
+    repo: list[str] = typer.Argument(
+        ...,
+        help="path to the target repository to plan execution for.",
+    ),
+) -> None:
+    """
+    synthesize an execution plan from a repository fingerprint.
+
+    runs the fingerprinter, then converts the result into
+    an actionable runtime plan — install command, start command,
+    expected port, required services, and a confidence score.
+    """
+    out.banner()
+
+    full_path = " ".join(repo + ctx.args)
+    repo_path = Path(full_path).resolve()
+    if not repo_path.exists():
+        out.failure(f"path does not exist: {repo_path}")
+        raise typer.Exit(code=1)
+
+    if not repo_path.is_dir():
+        out.failure(f"path is not a directory: {repo_path}")
+        raise typer.Exit(code=1)
+
+    from repoprobe.fingerprint import Fingerprinter
+    from repoprobe.planner import RuntimePlanner, render_plan
+
+    fingerprinter = Fingerprinter(repo_path)
+    fp = fingerprinter.run()
+
+    out.console.print()
+    out.info("synthesizing execution plan...")
+
+    planner = RuntimePlanner(fp, repo_path)
+    execution_plan = planner.synthesize()
+    render_plan(execution_plan)
+
+
 @app.command()
 def check() -> None:
     """
