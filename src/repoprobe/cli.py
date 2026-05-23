@@ -79,6 +79,10 @@ def run(
     from repoprobe.runner import ExecutionRunner, RuntimeStatus
     from repoprobe.probe import RuntimeProbe, render_probe_result
     from repoprobe.verifier import BehavioralVerifier, render_verification
+    from repoprobe.claims import (
+        ClaimExtractor, ContradictionEngine,
+        ContradictionReport, render_contradictions,
+    )
 
     out.phase_header(1, "fingerprint")
     fingerprinter = Fingerprinter(repo_path)
@@ -129,6 +133,32 @@ def run(
     else:
         runner.shutdown()
 
+    # phase 6: claim contradiction analysis (runs regardless of boot status)
+    contradiction_report = ContradictionReport()
+    try:
+        out.phase_header(6, "claim contradiction analysis")
+        extractor = ClaimExtractor(repo_path)
+        claims = extractor.extract()
+
+        contradiction_report.readme_found = extractor.readme_path is not None
+        contradiction_report.readme_path = str(extractor.readme_path or "")
+        contradiction_report.claims = claims
+
+        if claims:
+            engine = ContradictionEngine(
+                claims=claims,
+                probe_result=probe_result,
+                verification_result=verification_result,
+                fingerprint=fp,
+                run_result=result,
+            )
+            contradiction_report.contradictions = engine.analyze()
+
+        render_contradictions(contradiction_report)
+
+    except Exception as e:
+        out.warning(f"claim analysis failed: {e}")
+
     # final summary
     out.console.print()
     out.console.rule("[phase]result[/phase]")
@@ -152,16 +182,33 @@ def run(
                     f"verification: {verification_result.clean_count} clean "
                     f"/ {verification_result.total_verified} verified"
                 )
+        if contradiction_report.contradictions:
+            critical = len(contradiction_report.critical)
+            high = len(contradiction_report.high)
+            total = len(contradiction_report.contradictions)
+            out.failure(
+                f"contradictions: {total} detected "
+                f"({critical} critical, {high} high)"
+            )
+        elif contradiction_report.claims:
+            out.success(
+                f"claims: {len(contradiction_report.claims)} extracted, "
+                f"0 contradictions"
+            )
     elif result.status in (RuntimeStatus.CRASHED, RuntimeStatus.BOOT_FAILED, RuntimeStatus.INSTALL_FAILED):
         out.failure(f"status: {result.status.value}")
         if result.error:
             out.muted(f"  {result.error}")
+        if contradiction_report.contradictions:
+            total = len(contradiction_report.contradictions)
+            out.failure(f"contradictions: {total} detected")
     else:
         out.warning(f"status: {result.status.value}")
         if result.error:
             out.muted(f"  {result.error}")
 
     out.console.print()
+
 
 
 
