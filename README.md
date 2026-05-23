@@ -34,6 +34,164 @@ the core runtime uses python 3.12+ with asyncio. the cli layer uses typer. the t
 
 repoprobe is not another coding copilot, not another static analyzer, not another ci pipeline, not another ai agent wrapper, and not another autonomous coding framework. it does not generate software. it verifies whether generated software behaves consistently with its claims. repoprobe belongs to a new category called managed execution assurance, which exists because ai-generated software increasingly separates believable appearance from behavioral correctness. repoprobe is infrastructure designed to close that gap.
 
-## license
+# usage
 
-this project is currently under development for the google i/o 2026 hackathon.
+repoprobe currently supports python and node.js web repositories with automatic runtime fingerprinting, execution planning, behavioral verification, contradiction analysis, and AI assisted runtime investigation.
+
+---
+
+# installation
+
+ilone the repository:
+
+```bash
+git clone https://github.com/shiv669/repoprobe.git
+cd repoprobe
+```
+
+Install dependencies:
+
+```bash
+pip install -e .
+```
+
+optional `.env` configuration for gemini analysis:
+
+```env
+GOOGLE_API_KEY=your_api_key
+```
+
+---
+
+# commands
+
+## fingerprint a repository
+
+analyzes repository structure and infers runtime metadata.
+
+```bash
+repoprobe inspect ./target-repo
+```
+
+
+---
+
+## generate an execution plan
+
+synthesizes deterministic runtime execution strategy.
+
+```bash
+repoprobe plan ./target-repo
+```
+
+---
+
+## runtime verification
+
+boots the repository, probes runtime surfaces, verifies behavioral consistency, and analyzes contradictions against README claims.
+
+```bash
+repoprobe run ./target-repo
+```
+
+Pipeline:
+
+```text
+fingerprint
+→ execution plan
+→ runtime execution
+→ surface discovery
+→ behavioral verification
+→ contradiction analysis
+→ Gemini evidence synthesis
+```
+
+---
+
+## autonomous investigation
+
+escalates suspicious runtime behavior into deeper investigation workflows.
+
+```bash
+repoprobe investigate ./target-repo
+```
+
+investigation capabilities include:
+
+• endpoint fuzzing  
+• invariant response detection  
+• auth variation testing  
+• runtime contradiction escalation  
+• information leakage analysis  
+• trust score degradation  
+• gemini runtime reasoning  
+
+---
+
+# example
+
+```bash
+repoprobe investigate ./suspicious-ai-saas
+```
+
+example investigation stream:
+
+```text
+[probe] discovered 11 reachable routes
+
+[verify] invariant auth behavior detected
+
+[analysis] contradiction confidence escalated → 0.91
+
+[investigation] fuzzing GET /health
+
+[evidence] malformed jwt accepted
+
+[risk] severity escalated → CRITICAL
+
+[ai-analysis] observed runtime behavior does not support claimed authentication guarantees
+```
+
+---
+
+# current support
+
+supported stacks:
+
+• fastapi
+• flask  
+• django  
+• express.js  
+• next.js  
+
+---
+
+# architecture
+
+repoprobe separates deterministic runtime evidence generation from ai reasoning.
+
+deterministic systems handle:
+
+• repository fingerprinting  
+• execution planning  
+• runtime probing  
+• behavioral verification  
+• contradiction detection  
+
+gemini 3.5 flash handles:
+
+• runtime evidence synthesis  
+• contradiction interpretation  
+• investigation reasoning  
+
+the model never generates evidence directly.
+
+---
+
+# important notes
+
+repoprobe executes repositories locally during investigation.
+
+always run untrusted repositories inside isolated environments or disposable virtual machines.
+
+managed agent integration was partially explored during development, but the current submission primarily focuses on deterministic execution assurance and runtime investigation workflows.
